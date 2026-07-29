@@ -1,0 +1,107 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "site-status-alerts",
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.cjs"
+  },
+  "permissions": {
+    "redis": true,
+    "reddit": {
+      "enable": true,
+      "scope": "moderator"
+    },
+    "http": {
+      "enable": true,
+      "domains": [
+        "www.redditstatus.com",
+        "discord.com"
+      ]
+    }
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Check Reddit site status",
+        "description": "Check for active Reddit incidents at the configured severity",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/check-reddit-status"
+      }
+    ]
+  },
+  "scheduler": {
+    "tasks": {
+      "check-reddit-status": {
+        "endpoint": "/internal/scheduler/check-reddit-status",
+        "cron": "0 * * * *"
+      }
+    }
+  },
+  "settings": {
+    "subreddit": {
+      "incident-filtering": {
+        "type": "group",
+        "label": "Incident filtering",
+        "helpText": "Choose which Reddit incidents are important enough to notify moderators about.",
+        "fields": {
+          "minimumIncidentSeverity": {
+            "type": "select",
+            "label": "Minimum incident severity",
+            "helpText": "Incidents below this Statuspage severity are ignored. Records with no severity and maintenance notices are also ignored.",
+            "options": [
+              {
+                "label": "Minor or higher",
+                "value": "minor"
+              },
+              {
+                "label": "Major or higher",
+                "value": "major"
+              },
+              {
+                "label": "Critical only",
+                "value": "critical"
+              }
+            ],
+            "defaultValue": "major"
+          }
+        }
+      },
+      "discord-notifications": {
+        "type": "group",
+        "label": "Discord notifications",
+        "helpText": "Configure where qualifying active Reddit incidents should be reported.",
+        "fields": {
+          "discordWebhookUrl": {
+            "type": "string",
+            "label": "Discord webhook URL",
+            "helpText": "Paste a webhook URL copied from a Discord channel's Integrations settings.",
+            "placeholder": "https://discord.com/api/webhooks/...",
+            "defaultValue": "",
+            "validationEndpoint": "/internal/settings/validate-discord-webhook"
+          }
+        }
+      },
+      "modmail-notifications": {
+        "type": "group",
+        "label": "Modmail notifications",
+        "helpText": "Send native Reddit Modmail notifications to this subreddit's moderators.",
+        "fields": {
+          "modmailNotificationsEnabled": {
+            "type": "boolean",
+            "label": "Enable Modmail notifications",
+            "helpText": "Send active incident and resolution alerts to this subreddit's Modmail. This can be used with Discord or as the only notification channel.",
+            "defaultValue": false
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "dev": "npm run build:server -- --watch",
+    "build": "npm run build"
+  },
+  "dev": {
+    "subreddit": "site_status_alert_dev"
+  }
+}

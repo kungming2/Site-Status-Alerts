@@ -1,0 +1,30 @@
+{
+  "name": "site-status-alerts",
+  "version": "0.3.0",
+  "description": "A Devvit moderator tool that reports Reddit site incidents through Discord and native Modmail.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:server",
+    "build:server": "esbuild --bundle --log-level=warning --sourcemap=linked --target=es2023 --format=cjs --outfile=dist/server/index.cjs --platform=node src/server/index.ts",
+    "deploy": "devvit upload",
+    "dev": "devvit playtest",
+    "launch": "devvit publish",
+    "login": "devvit login",
+    "test": "npm run type-check && npm run test:unit && npm run build",
+    "test:unit": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test src/**/*.test.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@devvit/redis": "0.13.10",
+    "@devvit/web": "0.13.10",
+    "@types/node": "20.14.12",
+    "devvit": "0.13.10",
+    "esbuild": "0.25.9",
+    "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "license": "BSD-3-Clause"
+}

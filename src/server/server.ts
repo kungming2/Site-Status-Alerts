@@ -1,0 +1,340 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+import {
+  reddit,
+  settings,
+  type TaskRequest,
+  type TaskResponse,
+} from '@devvit/web/server';
+import type {
+  SettingsValidationRequest,
+  SettingsValidationResponse,
+  UiResponse,
+} from '@devvit/web/shared';
+
+import { redisIncidentStore } from './incident-store.ts';
+import {
+  checkRedditStatus,
+  normalizeMinimumIncidentSeverity,
+  validateDiscordWebhookUrl,
+  type StatusCheckResult,
+} from './status.ts';
+
+const DISCORD_WEBHOOK_SETTING = 'discordWebhookUrl';
+const MODMAIL_NOTIFICATIONS_SETTING = 'modmailNotificationsEnabled';
+const MINIMUM_INCIDENT_SEVERITY_SETTING = 'minimumIncidentSeverity';
+
+type ErrorResponse = {
+  error: string;
+  status: number;
+};
+
+export async function onRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  try {
+    await route(request, response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('Unhandled server error:', error);
+    writeJson(response, 500, { error: message, status: 500 });
+  }
+}
+
+async function route(
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  const pathname = new URL(
+    request.url ?? '/',
+    'https://reddit-site-status.local',
+  ).pathname;
+
+  if (request.method !== 'POST') {
+    writeJson(response, 404, { error: 'Not found', status: 404 });
+    return;
+  }
+
+  switch (pathname) {
+    case '/internal/menu/check-reddit-status':
+      writeJson(response, 200, await handleManualCheck());
+      return;
+    case '/internal/scheduler/check-reddit-status':
+      await readJson<TaskRequest>(request);
+      writeJson(response, 200, await handleScheduledCheck());
+      return;
+    case '/internal/settings/validate-discord-webhook':
+      writeJson(response, 200, await handleWebhookValidation(request));
+      return;
+    default:
+      writeJson(response, 404, { error: 'Not found', status: 404 });
+  }
+}
+
+async function handleManualCheck(): Promise<UiResponse> {
+  try {
+    const result = await runConfiguredCheck();
+    return {
+      showToast: {
+        text: manualCheckMessage(result),
+        appearance: result.reportableIncidents.length === 0 ? 'success' : 'neutral',
+      },
+    };
+  } catch (error) {
+    console.error('Manual Reddit status check failed:', error);
+    return {
+      showToast: {
+        text: `Reddit status check failed: ${errorMessage(error)}`,
+        appearance: 'neutral',
+      },
+    };
+  }
+}
+
+async function handleScheduledCheck(): Promise<TaskResponse> {
+  try {
+    const result = await runConfiguredCheck();
+    console.log(scheduledCheckMessage(result));
+  } catch (error) {
+    // Match the original report's fail-soft behavior so a temporary API or
+    // webhook failure does not disable future hourly checks.
+    console.error('Scheduled Reddit status check failed:', error);
+  }
+
+  return { status: 'ok' };
+}
+
+async function handleWebhookValidation(
+  request: IncomingMessage,
+): Promise<SettingsValidationResponse> {
+  const { value } =
+    await readJson<SettingsValidationRequest<string>>(request);
+  const validationError = validateDiscordWebhookUrl(value);
+
+  return validationError
+    ? { success: false, error: validationError }
+    : { success: true };
+}
+
+async function runConfiguredCheck(): Promise<StatusCheckResult> {
+  const [webhookUrl, modmailEnabled, minimumIncidentSeverity] =
+    await Promise.all([
+      settings.get<string>(DISCORD_WEBHOOK_SETTING),
+      settings.get<boolean>(MODMAIL_NOTIFICATIONS_SETTING),
+      settings.get<string>(MINIMUM_INCIDENT_SEVERITY_SETTING),
+    ]);
+  let subredditPromise: ReturnType<typeof reddit.getCurrentSubreddit> | undefined;
+
+  return checkRedditStatus(
+    {
+      discordWebhookUrl: webhookUrl?.trim(),
+      modmailEnabled: modmailEnabled === true,
+      minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
+        minimumIncidentSeverity,
+      ),
+    },
+    {
+      incidentStore: redisIncidentStore,
+      sendModmailNotification: async ({ subject, bodyMarkdown }) => {
+        subredditPromise ??= reddit.getCurrentSubreddit();
+        const subreddit = await subredditPromise;
+        await reddit.modMail.createModNotification({
+          subject,
+          bodyMarkdown,
+          subredditId: subreddit.id,
+        });
+      },
+    },
+  );
+}
+
+function manualCheckMessage(result: StatusCheckResult): string {
+  const reportableCount = result.reportableIncidents.length;
+  const newCount = result.newReportableIncidents.length;
+  const ongoingCount = result.ongoingReportableIncidents.length;
+  const resolvedCount = result.resolvedIncidents.length;
+  const ignoredCount = result.ignoredIncidents;
+  const severity = titleCase(result.minimumIncidentSeverity);
+  const messages: string[] = [];
+
+  if (reportableCount === 0) {
+    const ignoredText =
+      ignoredCount === 0
+        ? ''
+        : ` (${ignoredCount} incident record${
+            ignoredCount === 1 ? '' : 's'
+          } below the minimum ignored)`;
+    messages.push(
+      `All clear: no Reddit incidents meeting the ${severity} minimum${ignoredText}.`,
+    );
+  } else if (
+    newCount === 0 &&
+    result.channelNotifications.discord.active === 'not-needed' &&
+    result.channelNotifications.modmail.active === 'not-needed'
+  ) {
+    messages.push(
+      `Found ${ongoingCount} ongoing incident${
+        ongoingCount === 1 ? '' : 's'
+      } meeting the ${severity} minimum; no new notification was needed.`,
+    );
+  } else {
+    messages.push(
+      activeNotificationMessage(
+        newCount || ongoingCount,
+        newCount > 0 ? 'new' : 'ongoing',
+        result.channelNotifications,
+      ),
+    );
+  }
+
+  if (resolvedCount > 0) {
+    messages.push(
+      resolvedNotificationMessage(
+        resolvedCount,
+        result.channelNotifications,
+      ),
+    );
+  }
+
+  return messages.join(' ');
+}
+
+function scheduledCheckMessage(result: StatusCheckResult): string {
+  return [
+    'Reddit status check complete:',
+    `${result.newReportableIncidents.length} new reportable,`,
+    `${result.ongoingReportableIncidents.length} ongoing reportable,`,
+    `minimum severity=${result.minimumIncidentSeverity},`,
+    `${result.ignoredIncidents} below minimum,`,
+    `${result.resolvedIncidents.length} resolved;`,
+    `Discord active=${result.channelNotifications.discord.active},`,
+    `resolved=${result.channelNotifications.discord.resolved};`,
+    `Modmail active=${result.channelNotifications.modmail.active},`,
+    `resolved=${result.channelNotifications.modmail.resolved}.`,
+  ].join(' ');
+}
+
+function activeNotificationMessage(
+  incidentCount: number,
+  lifecycle: 'new' | 'ongoing',
+  notifications: StatusCheckResult['channelNotifications'],
+): string {
+  const incidentText = `${incidentCount} ${lifecycle} incident${
+    incidentCount === 1 ? '' : 's'
+  }`;
+
+  return `Found ${incidentText}; ${notificationSummary(
+    'active',
+    notifications,
+  )}.`;
+}
+
+function resolvedNotificationMessage(
+  incidentCount: number,
+  notifications: StatusCheckResult['channelNotifications'],
+): string {
+  const incidentText = `${incidentCount} incident${
+    incidentCount === 1 ? '' : 's'
+  } resolved`;
+
+  return `${incidentText}; ${notificationSummary(
+    'resolved',
+    notifications,
+  )}.`;
+}
+
+function notificationSummary(
+  kind: 'active' | 'resolved',
+  notifications: StatusCheckResult['channelNotifications'],
+): string {
+  const sent = channelNamesForResult(kind, notifications, 'sent');
+  const failed = channelNamesForResult(kind, notifications, 'failed');
+  const invalid = channelNamesForResult(kind, notifications, 'invalid');
+  const parts: string[] = [];
+
+  if (sent) {
+    parts.push(`${sent} ${kind === 'active' ? 'alert' : 'resolution alert'}${
+      sent.includes(' and ') ? 's were' : ' was'
+    } sent`);
+  }
+  if (failed) {
+    parts.push(`${failed} delivery failed and will be retried`);
+  }
+  if (invalid) {
+    parts.push('the configured Discord webhook URL is invalid');
+  }
+
+  if (parts.length > 0) {
+    return parts.join('; ');
+  }
+
+  const allNotConfigured =
+    notifications.discord[kind] === 'not-configured' &&
+    notifications.modmail[kind] === 'not-configured';
+  if (allNotConfigured) {
+    return 'configure a Discord webhook or enable Modmail notifications to receive alerts';
+  }
+
+  return 'no notification was needed';
+}
+
+function channelNamesForResult(
+  kind: 'active' | 'resolved',
+  notifications: StatusCheckResult['channelNotifications'],
+  result: StatusCheckResult['notifications']['active'],
+): string {
+  const channels = [
+    notifications.discord[kind] === result ? 'Discord' : undefined,
+    notifications.modmail[kind] === result ? 'Modmail' : undefined,
+  ].filter((channel): channel is string => channel !== undefined);
+
+  return channels.join(' and ');
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return 'Unknown error';
+}
+
+function titleCase(value: string): string {
+  return `${value.charAt(0).toUpperCase()}${value.slice(1).toLowerCase()}`;
+}
+
+async function readJson<T>(request: IncomingMessage): Promise<T> {
+  const decoder = new TextDecoder();
+  let body = '';
+
+  for await (const chunk of request) {
+    body += decoder.decode(
+      typeof chunk === 'string' ? Buffer.from(chunk) : chunk,
+      { stream: true },
+    );
+  }
+  body += decoder.decode();
+
+  if (!body) {
+    throw new Error('Request body is required');
+  }
+
+  return JSON.parse(body) as T;
+}
+
+function writeJson(
+  response: ServerResponse,
+  status: number,
+  payload:
+    | UiResponse
+    | TaskResponse
+    | SettingsValidationResponse
+    | ErrorResponse,
+): void {
+  const body = JSON.stringify(payload);
+  response.writeHead(status, {
+    'Content-Length': Buffer.byteLength(body),
+    'Content-Type': 'application/json',
+  });
+  response.end(body);
+}

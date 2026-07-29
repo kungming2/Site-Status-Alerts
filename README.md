@@ -1,0 +1,55 @@
+# Site Status Alerts
+
+**Site Status Alerts** (SSA) is a Devvit app that alerts moderators about Reddit's 
+sitewide incidents listed on their [service status page](https://www.redditstatus.com/). 
+Unsure if Reddit is actually down or if your internet is just acting a bit
+weird? SSA can send you notifications on either Discord or modmail. 
+
+## Implementation
+
+Every hour, this app checks Reddit's public Statuspage API for unresolved 
+incidents. Active incidents whose severity meets the subreddit's configured 
+minimum can be sent to a Discord webhook, the subreddit's native Modmail, or both. 
+When an incident is resolved, the app sends resolution alerts through
+the enabled channels and removes any stored records.
+
+The app also adds a moderator-only **Check Reddit site status** item to the
+subreddit menu. A manual check shows the result in a Reddit toast and runs
+the otherwise automated hourly check.
+
+## Configuration
+
+After installing the app, open its subreddit settings:
+
+- Under **Incident filtering**, choose a **Minimum incident severity**:
+  🟡 **Minor or higher**, 🟠 **Major or higher**, or 🔴 **Critical only**. 
+  The default is **Major or higher**.
+- Under **Discord notifications**, enter a **Discord webhook URL**. (optional)
+- Under **Modmail notifications**, turn on **Enable Modmail notifications**.
+
+Please note that the app has no way of notifying moderators if modmail 
+notifications are turned off *and* there is no entered Discord Webhook.
+
+Discord renders incident timestamps in each viewer's locale and time zone. Modmail
+keeps the UTC timestamp visible and links it to Timeanddate's local-time
+conversion page.
+
+## Data Storage
+
+Each subreddit installation stores only the public details of incidents for
+which it successfully sent an active alert, together with which enabled
+notification channels have succeeded. Incident records are stored in
+installation-scoped Devvit Redis, refreshed while the incident remains active,
+and deleted after the enabled resolution notifications are complete.
+
+## Fetch Domains
+
+The app requests access to these exact domains:
+
+- `www.redditstatus.com` — fetches Reddit's unresolved incident feed.
+- `discord.com` — posts incident and resolution alerts when a webhook is
+  configured.
+
+## Version History
+
+* **0.3.0**: Implement severity filtering in settings. 
