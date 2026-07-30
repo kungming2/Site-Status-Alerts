@@ -7,7 +7,7 @@ weird? SSA can send you notifications on Discord, Slack, or modmail.
 
 ## Implementation
 
-Every hour, this app checks Reddit's public [Statuspage API](https://www.redditstatus.com/#) for unresolved
+Every 30 minutes, this app checks Reddit's public [Statuspage API](https://www.redditstatus.com/#) for unresolved
 incidents. Active incidents whose severity meets the subreddit's configured 
 minimum can be sent to Discord, Slack, the subreddit's native Modmail, or any
 combination of the three.
@@ -16,7 +16,13 @@ the enabled channels and removes any stored records.
 
 The app also adds a moderator-only **Check Reddit site status** item to the
 subreddit menu. A manual check shows the result in a Reddit toast and runs
-the otherwise automated hourly check.
+the otherwise automated 30-minute check.
+
+Moderators can use **Send test outage alerts** from the same menu to send
+clearly marked minor, major, and critical mock incidents through the configured
+notification channels. The configured minimum severity still applies. Test
+alerts have a bold test-only notice and do not create incident records or later
+send resolution alerts.
 
 ## Configuration
 
@@ -50,14 +56,18 @@ and deleted after the enabled resolution notifications are complete.
 
 The app requests access to these three domains:
 
-- `www.redditstatus.com` — fetches Reddit's unresolved incident feed.
+- `redditstatus.com` — fetches Reddit's unresolved incident feed.
 - `discord.com` — posts incident and resolution alerts when a webhook is
   configured. Discord is on the Devvit [global fetch allowlist](https://developers.reddit.com/docs/capabilities/http-fetch#global-fetch-allowlist).
-- `hooks.slack.com` — posts incident and resolution alerts when a Slack incoming
-  webhook is configured.
+- `slack.com` — posts incident and resolution alerts when a Slack incoming
+  webhook is configured. Slack is on the Devvit [global fetch allowlist](https://developers.reddit.com/docs/capabilities/http-fetch#global-fetch-allowlist).
 
 ## Version History
 
+* **0.5.2**: Display Discord incident, resolution, and test notifications as
+  compact rich embeds with severity-based colors and structured details.
+* **0.5.1**: Add moderator test outage alerts with severity filtering and
+  clearly marked Discord, Slack, and Modmail messages.
 * **0.5.0**: Add Slack incoming webhook alerts with independent delivery and
   retry tracking for active and resolved incidents.
 * **0.3.4**: Fix status checks reading the configured minimum incident severity

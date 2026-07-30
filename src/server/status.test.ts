@@ -6,15 +6,20 @@ import {
   fetchRedditIncidents,
   formatDiscordAlert,
   formatDiscordResolutionAlert,
+  formatDiscordTestAlert,
   formatModmailAlert,
   formatModmailResolutionAlert,
+  formatModmailTestAlert,
   formatSlackAlert,
   formatSlackResolutionAlert,
+  formatSlackTestAlert,
   normalizeMinimumIncidentSeverity,
   sendSlackAlert,
+  sendTestOutageAlerts,
   validateDiscordWebhookUrl,
   validateMinimumIncidentSeverity,
   validateSlackWebhookUrl,
+  type DiscordWebhookPayload,
   type IncidentClaimKind,
   type IncidentStore,
   type ModmailNotification,
@@ -80,7 +85,7 @@ class MemoryIncidentStore implements IncidentStore {
 
 function createStatusAndDiscordFetch(
   getIncidents: () => Record<string, unknown>[],
-  discordMessages: string[],
+  discordMessages: DiscordWebhookPayload[],
 ): typeof fetch {
   return async (input, init) => {
     if (String(input).includes('redditstatus.com')) {
@@ -90,9 +95,10 @@ function createStatusAndDiscordFetch(
       );
     }
 
-    discordMessages.push(
-      (JSON.parse(String(init?.body)) as { content: string }).content,
-    );
+    const payload = JSON.parse(
+      String(init?.body),
+    ) as DiscordWebhookPayload;
+    discordMessages.push({ embeds: payload.embeds });
     return new Response(null, { status: 204 });
   };
 }
@@ -185,7 +191,7 @@ test('checkRedditStatus defaults to major and ignores lower impacts', async (t) 
   assert.deepEqual(
     JSON.parse(String(requests[1].init?.body)),
     {
-      content: formatDiscordAlert([
+      ...formatDiscordAlert([
         {
           ...majorIncident,
           createdAt: undefined,
@@ -331,7 +337,7 @@ test('checkRedditStatus alerts once, stays quiet while active, and alerts when r
       shortlink: majorIncident.shortlink,
     },
   ];
-  const discordMessages: string[] = [];
+  const discordMessages: DiscordWebhookPayload[] = [];
   const resolvedAt = '2026-07-29T21:45:00.000Z';
   const fakeFetch = createStatusAndDiscordFetch(() => feed, discordMessages);
 
@@ -381,7 +387,7 @@ test('checkRedditStatus alerts once, stays quiet while active, and alerts when r
   assert.equal(afterResolution.resolvedIncidents.length, 0);
   assert.equal(incidentStore.active.size, 0);
   assert.equal(discordMessages.length, 2);
-  assert.equal(
+  assert.deepEqual(
     discordMessages[1],
     formatDiscordResolutionAlert([{ incident: majorIncident, resolvedAt }]),
   );
@@ -437,14 +443,15 @@ test('checkRedditStatus retains resolved incidents when the resolution alert fai
   ]);
   let discordStatus = 429;
   let now = new Date('2026-07-29T21:45:00.000Z');
-  const discordMessages: string[] = [];
+  const discordMessages: DiscordWebhookPayload[] = [];
   const fakeFetch: typeof fetch = async (input, init) => {
     if (String(input).includes('redditstatus.com')) {
       return new Response(JSON.stringify({ incidents: [] }), { status: 200 });
     }
-    discordMessages.push(
-      (JSON.parse(String(init?.body)) as { content: string }).content,
-    );
+    const payload = JSON.parse(
+      String(init?.body),
+    ) as DiscordWebhookPayload;
+    discordMessages.push({ embeds: payload.embeds });
     return new Response(null, { status: discordStatus });
   };
   const dependencies = {
@@ -475,8 +482,11 @@ test('checkRedditStatus retains resolved incidents when the resolution alert fai
   assert.equal(retried.notifications.resolved, 'sent');
   assert.equal(incidentStore.active.size, 0);
   assert.equal(discordMessages.length, 2);
-  assert.equal(discordMessages[0], discordMessages[1]);
-  assert.match(discordMessages[1] ?? '', /1 hour 45 minutes/);
+  assert.deepEqual(discordMessages[0], discordMessages[1]);
+  assert.match(
+    JSON.stringify(discordMessages[1] ?? {}),
+    /1 hour 45 minutes/,
+  );
 });
 
 test('concurrent checks claim a new incident only once', async (t) => {
@@ -596,7 +606,7 @@ test('dual-channel retries do not resend the channel that already succeeded', as
       impact: majorIncident.impact,
     },
   ];
-  const discordMessages: string[] = [];
+  const discordMessages: DiscordWebhookPayload[] = [];
   const modmailSubjects: string[] = [];
   let failNextModmail = true;
   const fakeFetch = createStatusAndDiscordFetch(() => feed, discordMessages);
@@ -717,13 +727,19 @@ test('Slack can be the only notification channel for the full incident lifecycle
 
 test('formatDiscordAlert includes incident details', () => {
   const message = formatDiscordAlert([majorIncident]);
+  const embed = message.embeds[0]!;
+  const renderedEmbed = JSON.stringify(embed);
 
-  assert.match(message, /Active Reddit Incidents/);
-  assert.match(message, /🟠/);
-  assert.match(message, /Elevated API errors/);
-  assert.match(message, /Investigating \(major\)/);
-  assert.match(message, /<t:1785355200:F> \(<t:1785355200:R>\)/);
-  assert.match(message, /<t:1785357000:F> \(<t:1785357000:R>\)/);
+  assert.equal(embed.title, '⚠️ Active Reddit Incidents');
+  assert.equal(embed.color, 0xf59e0b);
+  assert.equal(embed.fields.length, 1);
+  assert.match(renderedEmbed, /🟠/);
+  assert.match(renderedEmbed, /Elevated API errors/);
+  assert.match(renderedEmbed, /Investigating \(major\)/);
+  assert.match(renderedEmbed, /<t:1785355200:F> \(<t:1785355200:R>\)/);
+  assert.match(renderedEmbed, /<t:1785357000:F> \(<t:1785357000:R>\)/);
+  assert.match(renderedEmbed, /View incident details/);
+  assert.match(embed.footer.text, /1 active incident$/);
 });
 
 test('formatDiscordResolutionAlert includes the previous incident state', () => {
@@ -733,13 +749,17 @@ test('formatDiscordResolutionAlert includes the previous incident state', () => 
       resolvedAt: '2026-07-29T21:45:00.000Z',
     },
   ]);
+  const embed = message.embeds[0]!;
+  const renderedEmbed = JSON.stringify(embed);
 
-  assert.match(message, /Reddit Incidents Resolved/);
-  assert.match(message, /🟠/);
-  assert.match(message, /Elevated API errors/);
-  assert.match(message, /Status:\*\* Resolved/);
-  assert.match(message, /Previous state:\*\* Investigating \(major\)/);
-  assert.match(message, /Approx\. duration:\*\* 1 hour 45 minutes/);
+  assert.equal(embed.title, '✅ Reddit Incidents Resolved');
+  assert.equal(embed.color, 0x57f287);
+  assert.match(renderedEmbed, /🟠/);
+  assert.match(renderedEmbed, /Elevated API errors/);
+  assert.match(renderedEmbed, /Status:\*\* Resolved/);
+  assert.match(renderedEmbed, /Previous state:\*\* Investigating \(major\)/);
+  assert.match(renderedEmbed, /Approx\. duration:\*\* 1 hour 45 minutes/);
+  assert.match(embed.footer.text, /1 resolved incident$/);
 });
 
 test('formatSlackAlert uses mrkdwn links, escaped text, and localized timestamps', () => {
@@ -758,7 +778,7 @@ test('formatSlackAlert uses mrkdwn links, escaped text, and localized timestamps
   assert.doesNotMatch(message, /<!channel>/);
   assert.match(
     message,
-    /<!date\^1785355200\^\{date_long_pretty\} at \{time\}\|2026-07-29 20:00:00 UTC>/,
+    /<!date\^1785355200\^\{date_long_pretty} at \{time}\|2026-07-29 20:00:00 UTC>/,
   );
 });
 
@@ -787,12 +807,100 @@ test('Discord, Slack, and Modmail use an emoji for each incident severity', () =
   const slackMessage = formatSlackAlert(incidents);
   const modmailMessage = formatModmailAlert(incidents).bodyMarkdown;
 
-  for (const message of [discordMessage, slackMessage, modmailMessage]) {
+  for (const message of [
+    JSON.stringify(discordMessage),
+    slackMessage,
+    modmailMessage,
+  ]) {
     assert.match(message, /🟡/);
     assert.match(message, /🟠/);
     assert.match(message, /🔴/);
     assert.match(message, /⚠️/);
   }
+});
+
+test('test outage alerts respect severity and make the test section bold', async () => {
+  const webhookMessages = new Map<string, Record<string, unknown>>();
+  const modmailMessages: ModmailNotification[] = [];
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    webhookMessages.set(String(input), payload);
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await sendTestOutageAlerts(
+    {
+      discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+      slackWebhookUrl: 'https://hooks.slack.com/services/T000/B000/token',
+      modmailEnabled: true,
+      minimumIncidentSeverity: 'major',
+    },
+    {
+      fetchImpl: fakeFetch,
+      now: () => new Date('2026-07-30T18:00:00.000Z'),
+      sendModmailNotification: async (notification) => {
+        modmailMessages.push(notification);
+      },
+    },
+  );
+
+  assert.deepEqual(
+    result.incidents.map((incident) => incident.impact),
+    ['major', 'critical'],
+  );
+  assert.equal(result.excludedIncidents, 1);
+  assert.deepEqual(result.channelNotifications, {
+    discord: 'sent',
+    slack: 'sent',
+    modmail: 'sent',
+  });
+  assert.equal(webhookMessages.size, 2);
+  const discordPayload = webhookMessages.get(
+    'https://discord.com/api/webhooks/123/token',
+  ) as DiscordWebhookPayload | undefined;
+  const discordEmbed = discordPayload?.embeds[0];
+  assert.equal(discordEmbed?.title, '🧪 Test: Active Reddit Incidents');
+  assert.equal(discordEmbed?.color, 0x5865f2);
+  assert.match(
+    discordEmbed?.description ?? '',
+    /^\*\*This is not a real Reddit outage\.\*\*/,
+  );
+  assert.match(
+    String(
+      webhookMessages.get(
+        'https://hooks.slack.com/services/T000/B000/token',
+      )?.text ?? '',
+    ),
+    /^\*🧪 TEST NOTIFICATION — This is not a real Reddit outage\.\*/,
+  );
+  assert.equal(modmailMessages[0]?.subject.startsWith('[TEST]'), true);
+  assert.match(
+    modmailMessages[0]?.bodyMarkdown ?? '',
+    /^\*\*🧪 TEST NOTIFICATION — This is not a real Reddit outage\.\*\*/,
+  );
+});
+
+test('test alert formatters label messages without modifying real alerts', () => {
+  const discord = formatDiscordTestAlert([majorIncident]);
+  const slack = formatSlackTestAlert([majorIncident]);
+  const modmail = formatModmailTestAlert([majorIncident]);
+
+  assert.match(discord.embeds[0]?.title ?? '', /Active Reddit Incidents/);
+  assert.match(
+    discord.embeds[0]?.description ?? '',
+    /This is not a real Reddit outage/,
+  );
+  assert.match(slack, /Active Reddit Incidents/);
+  assert.match(modmail.bodyMarkdown, /Active Reddit Incidents/);
+  assert.doesNotMatch(
+    JSON.stringify(formatDiscordAlert([majorIncident])),
+    /Test notification/,
+  );
+  assert.doesNotMatch(formatSlackAlert([majorIncident]), /TEST NOTIFICATION/);
+  assert.doesNotMatch(
+    formatModmailAlert([majorIncident]).bodyMarkdown,
+    /TEST NOTIFICATION/,
+  );
 });
 
 test('Modmail links UTC timestamps to Timeanddate local conversions', () => {

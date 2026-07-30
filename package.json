@@ -1,6 +1,6 @@
 {
   "name": "site-status-alerts",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "description": "A Devvit moderator tool that reports Reddit site incidents through Discord, Slack, and native Modmail.",
   "private": true,
   "type": "module",

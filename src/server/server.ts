@@ -16,9 +16,13 @@ import { redisIncidentStore } from './incident-store.ts';
 import {
   checkRedditStatus,
   normalizeMinimumIncidentSeverity,
+  sendTestOutageAlerts,
   validateDiscordWebhookUrl,
   validateMinimumIncidentSeverity,
   validateSlackWebhookUrl,
+  type ModmailNotification,
+  type NotificationConfiguration,
+  type NotificationTestResult,
   type StatusCheckResult,
 } from './status.ts';
 
@@ -63,6 +67,9 @@ async function route(
     case '/internal/menu/check-reddit-status':
       writeJson(response, 200, await handleManualCheck());
       return;
+    case '/internal/menu/send-test-outage-alerts':
+      writeJson(response, 200, await handleTestOutageAlerts());
+      return;
     case '/internal/scheduler/check-reddit-status':
       await readJson<TaskRequest>(request);
       writeJson(response, 200, await handleScheduledCheck());
@@ -95,6 +102,32 @@ async function handleManualCheck(): Promise<UiResponse> {
     return {
       showToast: {
         text: `Reddit status check failed: ${errorMessage(error)}`,
+        appearance: 'neutral',
+      },
+    };
+  }
+}
+
+async function handleTestOutageAlerts(): Promise<UiResponse> {
+  try {
+    const result = await runConfiguredNotificationTest();
+    const deliveryResults = Object.values(result.channelNotifications);
+    return {
+      showToast: {
+        text: notificationTestMessage(result),
+        appearance:
+          deliveryResults.includes('sent') &&
+          !deliveryResults.includes('failed') &&
+          !deliveryResults.includes('invalid')
+            ? 'success'
+            : 'neutral',
+      },
+    };
+  } catch (error) {
+    console.error('Test outage notification failed:', error);
+    return {
+      showToast: {
+        text: `Test outage notification failed: ${errorMessage(error)}`,
         appearance: 'neutral',
       },
     };
@@ -151,6 +184,22 @@ async function handleSlackWebhookValidation(
 }
 
 async function runConfiguredCheck(): Promise<StatusCheckResult> {
+  const configuration = await readNotificationConfiguration();
+
+  return checkRedditStatus(configuration, {
+    incidentStore: redisIncidentStore,
+    sendModmailNotification: createModmailNotificationSender(),
+  });
+}
+
+async function runConfiguredNotificationTest(): Promise<NotificationTestResult> {
+  const configuration = await readNotificationConfiguration();
+  return sendTestOutageAlerts(configuration, {
+    sendModmailNotification: createModmailNotificationSender(),
+  });
+}
+
+async function readNotificationConfiguration(): Promise<NotificationConfiguration> {
   const [
     discordWebhookUrl,
     slackWebhookUrl,
@@ -163,30 +212,31 @@ async function runConfiguredCheck(): Promise<StatusCheckResult> {
       settings.get<boolean>(MODMAIL_NOTIFICATIONS_SETTING),
       settings.get<string[]>(MINIMUM_INCIDENT_SEVERITY_SETTING),
     ]);
+
+  return {
+    discordWebhookUrl: discordWebhookUrl?.trim(),
+    slackWebhookUrl: slackWebhookUrl?.trim(),
+    modmailEnabled: modmailEnabled === true,
+    minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
+      minimumIncidentSeverity,
+    ),
+  };
+}
+
+function createModmailNotificationSender(): (
+  notification: ModmailNotification,
+) => Promise<void> {
   let subredditPromise: ReturnType<typeof reddit.getCurrentSubreddit> | undefined;
 
-  return checkRedditStatus(
-    {
-      discordWebhookUrl: discordWebhookUrl?.trim(),
-      slackWebhookUrl: slackWebhookUrl?.trim(),
-      modmailEnabled: modmailEnabled === true,
-      minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
-        minimumIncidentSeverity,
-      ),
-    },
-    {
-      incidentStore: redisIncidentStore,
-      sendModmailNotification: async ({ subject, bodyMarkdown }) => {
-        subredditPromise ??= reddit.getCurrentSubreddit();
-        const subreddit = await subredditPromise;
-        await reddit.modMail.createModNotification({
-          subject,
-          bodyMarkdown,
-          subredditId: subreddit.id,
-        });
-      },
-    },
-  );
+  return async ({ subject, bodyMarkdown }) => {
+    subredditPromise ??= reddit.getCurrentSubreddit();
+    const subreddit = await subredditPromise;
+    await reddit.modMail.createModNotification({
+      subject,
+      bodyMarkdown,
+      subredditId: subreddit.id,
+    });
+  };
 }
 
 function manualCheckMessage(result: StatusCheckResult): string {
@@ -239,6 +289,42 @@ function manualCheckMessage(result: StatusCheckResult): string {
   }
 
   return messages.join(' ');
+}
+
+function notificationTestMessage(result: NotificationTestResult): string {
+  const sent = testChannelNamesForResult(result, 'sent');
+  const failed = testChannelNamesForResult(result, 'failed');
+  const invalid = testChannelNamesForResult(result, 'invalid');
+  const included = result.incidents.length;
+  const total = included + result.excludedIncidents;
+  const severity = titleCase(result.minimumIncidentSeverity);
+  const delivery: string[] = [];
+
+  if (sent) {
+    delivery.push(`sent to ${sent}`);
+  }
+  if (failed) {
+    delivery.push(`${failed} delivery failed`);
+  }
+  if (invalid) {
+    delivery.push(`${invalid} webhook configuration is invalid`);
+  }
+  if (delivery.length === 0) {
+    delivery.push(
+      'not sent because no Discord or Slack webhook is configured and Modmail notifications are disabled',
+    );
+  }
+
+  const excluded =
+    result.excludedIncidents === 0
+      ? ''
+      : `; ${result.excludedIncidents} lower-severity mock incident${
+          result.excludedIncidents === 1 ? ' was' : 's were'
+        } excluded`;
+
+  return `Test notification ${delivery.join(
+    '; ',
+  )}. Included ${included} of ${total} mock incidents at the ${severity} minimum${excluded}.`;
 }
 
 function scheduledCheckMessage(result: StatusCheckResult): string {
@@ -336,6 +422,23 @@ function channelNamesForResult(
     notifications.discord[kind] === result ? 'Discord' : undefined,
     notifications.slack[kind] === result ? 'Slack' : undefined,
     notifications.modmail[kind] === result ? 'Modmail' : undefined,
+  ].filter((channel): channel is string => channel !== undefined);
+
+  if (channels.length < 3) {
+    return channels.join(' and ');
+  }
+
+  return `${channels.slice(0, -1).join(', ')}, and ${channels.at(-1)}`;
+}
+
+function testChannelNamesForResult(
+  testResult: NotificationTestResult,
+  result: StatusCheckResult['notifications']['active'],
+): string {
+  const channels = [
+    testResult.channelNotifications.discord === result ? 'Discord' : undefined,
+    testResult.channelNotifications.slack === result ? 'Slack' : undefined,
+    testResult.channelNotifications.modmail === result ? 'Modmail' : undefined,
   ].filter((channel): channel is string => channel !== undefined);
 
   if (channels.length < 3) {

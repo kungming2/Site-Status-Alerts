@@ -26,11 +26,18 @@
   "menu": {
     "items": [
       {
-        "label": "Check Reddit site status",
+        "label": "[SSA] Check Reddit site status",
         "description": "Check for active Reddit incidents at the configured severity",
         "forUserType": "moderator",
         "location": "subreddit",
         "endpoint": "/internal/menu/check-reddit-status"
+      },
+      {
+        "label": "[SSA] Send test outage alerts",
+        "description": "Send clearly marked test incidents through configured notification channels",
+        "forUserType": "moderator",
+        "location": "subreddit",
+        "endpoint": "/internal/menu/send-test-outage-alerts"
       }
     ]
   },
@@ -38,7 +45,7 @@
     "tasks": {
       "check-reddit-status": {
         "endpoint": "/internal/scheduler/check-reddit-status",
-        "cron": "0 * * * *"
+        "cron": "*/30 * * * *"
       }
     }
   },
@@ -47,7 +54,7 @@
       "incident-filtering": {
         "type": "group",
         "label": "Incident filtering",
-        "helpText": "Choose which Reddit incidents are important enough to notify moderators about.",
+        "helpText": "Choose which Reddit incidents are important enough to receive notifications for.",
         "fields": {
           "minimumIncidentSeverity": {
             "type": "select",
@@ -75,7 +82,7 @@
       "discord-notifications": {
         "type": "group",
         "label": "Discord notifications",
-        "helpText": "Configure where qualifying active Reddit incidents should be reported.",
+        "helpText": "Get Discord notifications about site incidents.",
         "fields": {
           "discordWebhookUrl": {
             "type": "string",
@@ -90,7 +97,7 @@
       "slack-notifications": {
         "type": "group",
         "label": "Slack notifications",
-        "helpText": "Configure where qualifying active Reddit incidents should be reported.",
+        "helpText": "Get Slack notifications about site incidents.",
         "fields": {
           "slackWebhookUrl": {
             "type": "string",
@@ -105,12 +112,12 @@
       "modmail-notifications": {
         "type": "group",
         "label": "Modmail notifications",
-        "helpText": "Send native Reddit Modmail notifications to this subreddit's moderators.",
+        "helpText": "Send native Reddit Modmail notifications about site incidents.",
         "fields": {
           "modmailNotificationsEnabled": {
             "type": "boolean",
             "label": "Enable Modmail notifications",
-            "helpText": "Send active incident and resolution alerts to this subreddit's Modmail. This can be used with Discord or as the only notification channel.",
+            "helpText": "Send active incident and resolution alerts to this subreddit's Modmail.",
             "defaultValue": false
           }
         }

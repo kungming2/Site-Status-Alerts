@@ -1,6 +1,17 @@
 const REDDIT_STATUS_URL =
   'https://www.redditstatus.com/api/v2/incidents/unresolved.json';
-const DISCORD_CONTENT_LIMIT = 2_000;
+const DISCORD_EMBED_CHARACTER_LIMIT = 6_000;
+const DISCORD_EMBED_FIELD_LIMIT = 25;
+const DISCORD_EMBED_FIELD_NAME_LIMIT = 256;
+const DISCORD_EMBED_FIELD_VALUE_LIMIT = 1_024;
+const DISCORD_COLORS = {
+  minor: 0xfee75c,
+  major: 0xf59e0b,
+  critical: 0xed4245,
+  resolved: 0x57f287,
+  test: 0x5865f2,
+  unknown: 0x95a5a6,
+} as const;
 const SLACK_TEXT_LIMIT = 4_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const INCIDENT_SEVERITY_RANK = {
@@ -48,6 +59,33 @@ export type NotificationConfiguration = {
 export type ModmailNotification = {
   subject: string;
   bodyMarkdown: string;
+};
+
+export type DiscordEmbedField = {
+  name: string;
+  value: string;
+  inline?: boolean;
+};
+
+export type DiscordEmbed = {
+  title: string;
+  description?: string;
+  color: number;
+  fields: DiscordEmbedField[];
+  footer: {
+    text: string;
+  };
+};
+
+export type DiscordWebhookPayload = {
+  embeds: DiscordEmbed[];
+};
+
+export type NotificationTestResult = {
+  incidents: RedditIncident[];
+  excludedIncidents: number;
+  minimumIncidentSeverity: IncidentSeverity;
+  channelNotifications: Record<NotificationChannel, NotificationResult>;
 };
 
 type ChannelNotificationResults = Record<
@@ -102,6 +140,14 @@ export type IncidentStore = {
 
 type StatusCheckDependencies = {
   incidentStore: IncidentStore;
+  fetchImpl?: Fetch;
+  now?: () => Date;
+  sendModmailNotification?: (
+    notification: ModmailNotification,
+  ) => Promise<void>;
+};
+
+type NotificationTestDependencies = {
   fetchImpl?: Fetch;
   now?: () => Date;
   sendModmailNotification?: (
@@ -530,6 +576,65 @@ export async function checkRedditStatus(
   };
 }
 
+export async function sendTestOutageAlerts(
+  configuration: NotificationConfiguration,
+  dependencies: NotificationTestDependencies = {},
+): Promise<NotificationTestResult> {
+  const minimumIncidentSeverity = normalizeMinimumIncidentSeverity(
+    configuration.minimumIncidentSeverity,
+  );
+  const allIncidents = createTestIncidents(
+    dependencies.now?.() ?? new Date(),
+  );
+  const incidents = allIncidents.filter((incident) =>
+    meetsMinimumSeverity(incident.impact, minimumIncidentSeverity),
+  );
+  const discordWebhookUrl = configuration.discordWebhookUrl?.trim();
+  const slackWebhookUrl = configuration.slackWebhookUrl?.trim();
+  const sendModmailNotification = dependencies.sendModmailNotification;
+  const discordValidationError =
+    validateDiscordWebhookUrl(discordWebhookUrl);
+  const slackValidationError = validateSlackWebhookUrl(slackWebhookUrl);
+  const [discord, slack, modmail] = await Promise.all([
+    !discordWebhookUrl
+      ? Promise.resolve<NotificationResult>('not-configured')
+      : discordValidationError
+        ? Promise.resolve<NotificationResult>('invalid')
+        : sendTestChannel('Discord', () =>
+            sendDiscordAlert(
+              discordWebhookUrl,
+              formatDiscordTestAlert(incidents),
+              dependencies.fetchImpl,
+            ),
+          ),
+    !slackWebhookUrl
+      ? Promise.resolve<NotificationResult>('not-configured')
+      : slackValidationError
+        ? Promise.resolve<NotificationResult>('invalid')
+        : sendTestChannel('Slack', () =>
+            sendSlackAlert(
+              slackWebhookUrl,
+              formatSlackTestAlert(incidents),
+              dependencies.fetchImpl,
+            ),
+          ),
+    !configuration.modmailEnabled
+      ? Promise.resolve<NotificationResult>('not-configured')
+      : !sendModmailNotification
+        ? Promise.resolve<NotificationResult>('failed')
+        : sendTestChannel('Modmail', () =>
+            sendModmailNotification(formatModmailTestAlert(incidents)),
+          ),
+  ]);
+
+  return {
+    incidents,
+    excludedIncidents: allIncidents.length - incidents.length,
+    minimumIncidentSeverity,
+    channelNotifications: { discord, slack, modmail },
+  };
+}
+
 export async function fetchRedditIncidents(
   fetchImpl: Fetch = fetch,
 ): Promise<RedditIncident[]> {
@@ -564,14 +669,14 @@ export async function fetchRedditIncidents(
 
 export async function sendDiscordAlert(
   webhookUrl: string,
-  content: string,
+  payload: DiscordWebhookPayload,
   fetchImpl: Fetch = fetch,
 ): Promise<void> {
   const response = await fetchImpl(webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      content,
+      ...payload,
       username: 'Reddit Site Status',
       allowed_mentions: { parse: [] },
     }),
@@ -600,54 +705,36 @@ export async function sendSlackAlert(
   }
 }
 
-export function formatDiscordAlert(incidents: RedditIncident[]): string {
-  const header = '### ⚠️ Active Reddit Incidents';
-  const blocks = incidents.map((incident) =>
-    formatIncident(incident, formatDiscordTimestamp),
-  );
-  let message = header;
-
-  for (let index = 0; index < blocks.length; index += 1) {
-    const candidate = `${message}\n${blocks[index]}`;
-    if (candidate.length <= DISCORD_CONTENT_LIMIT) {
-      message = candidate;
-      continue;
-    }
-
-    const omitted = blocks.length - index;
-    const suffix = `\n\n_${omitted} additional incident${
-      omitted === 1 ? '' : 's'
-    } omitted to fit Discord's message limit._`;
-    const available = DISCORD_CONTENT_LIMIT - suffix.length;
-    return `${message.slice(0, available).trimEnd()}${suffix}`;
-  }
-
-  return message;
+export function formatDiscordAlert(
+  incidents: RedditIncident[],
+): DiscordWebhookPayload {
+  return {
+    embeds: [
+      createDiscordIncidentEmbed({
+        title: '⚠️ Active Reddit Incidents',
+        color: discordSeverityColor(incidents),
+        incidents,
+        formatField: formatDiscordIncidentField,
+        incidentLabel: 'active incident',
+      }),
+    ],
+  };
 }
 
 export function formatDiscordResolutionAlert(
   incidents: Array<RedditIncident | IncidentResolution>,
-): string {
-  const header = '### ✅ Reddit Incidents Resolved';
-  const blocks = incidents.map(formatResolvedIncident);
-  let message = header;
-
-  for (let index = 0; index < blocks.length; index += 1) {
-    const candidate = `${message}\n${blocks[index]}`;
-    if (candidate.length <= DISCORD_CONTENT_LIMIT) {
-      message = candidate;
-      continue;
-    }
-
-    const omitted = blocks.length - index;
-    const suffix = `\n\n_${omitted} additional resolved incident${
-      omitted === 1 ? '' : 's'
-    } omitted to fit Discord's message limit._`;
-    const available = DISCORD_CONTENT_LIMIT - suffix.length;
-    return `${message.slice(0, available).trimEnd()}${suffix}`;
-  }
-
-  return message;
+): DiscordWebhookPayload {
+  return {
+    embeds: [
+      createDiscordIncidentEmbed({
+        title: '✅ Reddit Incidents Resolved',
+        color: DISCORD_COLORS.resolved,
+        incidents,
+        formatField: formatDiscordResolvedIncidentField,
+        incidentLabel: 'resolved incident',
+      }),
+    ],
+  };
 }
 
 export function formatSlackAlert(incidents: RedditIncident[]): string {
@@ -696,6 +783,46 @@ export function formatModmailResolutionAlert(
       '## ✅ Reddit Incidents Resolved',
       '',
       ...incidents.map(formatResolvedIncident),
+    ].join('\n'),
+  };
+}
+
+export function formatDiscordTestAlert(
+  incidents: RedditIncident[],
+): DiscordWebhookPayload {
+  return {
+    embeds: [
+      createDiscordIncidentEmbed({
+        title: '🧪 Test: Active Reddit Incidents',
+        description: '**This is not a real Reddit outage.**',
+        color: DISCORD_COLORS.test,
+        incidents,
+        formatField: formatDiscordIncidentField,
+        incidentLabel: 'mock incident',
+        footerPrefix: 'Site Status Alerts • Test notification',
+      }),
+    ],
+  };
+}
+
+export function formatSlackTestAlert(incidents: RedditIncident[]): string {
+  return [
+    '*🧪 TEST NOTIFICATION — This is not a real Reddit outage.*',
+    '',
+    formatSlackAlert(incidents),
+  ].join('\n');
+}
+
+export function formatModmailTestAlert(
+  incidents: RedditIncident[],
+): ModmailNotification {
+  const alert = formatModmailAlert(incidents);
+  return {
+    subject: `[TEST] ${alert.subject}`,
+    bodyMarkdown: [
+      '**🧪 TEST NOTIFICATION — This is not a real Reddit outage.**',
+      '',
+      alert.bodyMarkdown,
     ].join('\n'),
   };
 }
@@ -816,6 +943,229 @@ function formatSlackMessage(
   }
 
   return message;
+}
+
+function createDiscordIncidentEmbed<T>({
+  title,
+  description,
+  color,
+  incidents,
+  formatField,
+  incidentLabel,
+  footerPrefix = 'Site Status Alerts',
+}: {
+  title: string;
+  description?: string;
+  color: number;
+  incidents: T[];
+  formatField: (incident: T) => DiscordEmbedField;
+  incidentLabel: string;
+  footerPrefix?: string;
+}): DiscordEmbed {
+  const fields: DiscordEmbedField[] = [];
+
+  for (const incident of incidents) {
+    if (fields.length >= DISCORD_EMBED_FIELD_LIMIT) {
+      break;
+    }
+
+    const candidateFields = [...fields, formatField(incident)];
+    const candidate = buildDiscordIncidentEmbed({
+      title,
+      description,
+      color,
+      fields: candidateFields,
+      totalIncidents: incidents.length,
+      incidentLabel,
+      footerPrefix,
+    });
+    if (
+      discordEmbedCharacterCount(candidate) > DISCORD_EMBED_CHARACTER_LIMIT
+    ) {
+      break;
+    }
+
+    fields.push(candidateFields.at(-1)!);
+  }
+
+  return buildDiscordIncidentEmbed({
+    title,
+    description,
+    color,
+    fields,
+    totalIncidents: incidents.length,
+    incidentLabel,
+    footerPrefix,
+  });
+}
+
+function buildDiscordIncidentEmbed({
+  title,
+  description,
+  color,
+  fields,
+  totalIncidents,
+  incidentLabel,
+  footerPrefix,
+}: {
+  title: string;
+  description?: string;
+  color: number;
+  fields: DiscordEmbedField[];
+  totalIncidents: number;
+  incidentLabel: string;
+  footerPrefix: string;
+}): DiscordEmbed {
+  const omitted = totalIncidents - fields.length;
+  const omissionNotice =
+    omitted > 0
+      ? `_${omitted} additional ${incidentLabel}${
+          omitted === 1 ? '' : 's'
+        } omitted to fit Discord's embed limits._`
+      : undefined;
+  const combinedDescription = [description, omissionNotice]
+    .filter((part): part is string => Boolean(part))
+    .join('\n\n');
+  const countLabel = `${totalIncidents} ${incidentLabel}${
+    totalIncidents === 1 ? '' : 's'
+  }`;
+  const shownLabel =
+    omitted > 0 ? `Showing ${fields.length} of ${countLabel}` : countLabel;
+
+  return {
+    title,
+    ...(combinedDescription ? { description: combinedDescription } : {}),
+    color,
+    fields,
+    footer: {
+      text: `${footerPrefix} • ${shownLabel}`,
+    },
+  };
+}
+
+function discordEmbedCharacterCount(embed: DiscordEmbed): number {
+  return (
+    embed.title.length +
+    (embed.description?.length ?? 0) +
+    embed.footer.text.length +
+    embed.fields.reduce(
+      (total, field) => total + field.name.length + field.value.length,
+      0,
+    )
+  );
+}
+
+function formatDiscordIncidentField(
+  incident: RedditIncident,
+): DiscordEmbedField {
+  const detailsLink = formatDiscordIncidentLink(incident.shortlink);
+  const value = [
+    `**Status:** ${truncateDiscordText(
+      titleCase(incident.status),
+      128,
+    )} (${truncateDiscordText(incident.impact, 64)})`,
+    `**Created:** ${formatDiscordTimestamp(incident.createdAt)}`,
+    `**Updated:** ${formatDiscordTimestamp(incident.updatedAt)}`,
+    detailsLink,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n');
+
+  return {
+    name: truncateDiscordText(
+      `${incidentSeverityEmoji(incident.impact)} ${incident.name}`,
+      DISCORD_EMBED_FIELD_NAME_LIMIT,
+    ),
+    value: truncateDiscordText(value, DISCORD_EMBED_FIELD_VALUE_LIMIT),
+    inline: false,
+  };
+}
+
+function formatDiscordResolvedIncidentField(
+  resolution: RedditIncident | IncidentResolution,
+): DiscordEmbedField {
+  const { incident, resolvedAt } =
+    'incident' in resolution
+      ? resolution
+      : { incident: resolution, resolvedAt: resolution.updatedAt };
+  const detailsLink = formatDiscordIncidentLink(incident.shortlink);
+  const value = [
+    '**Status:** Resolved',
+    `**Previous state:** ${truncateDiscordText(
+      titleCase(incident.status),
+      128,
+    )} (${truncateDiscordText(incident.impact, 64)})`,
+    `**Approx. duration:** ${formatIncidentDuration(
+      incident.createdAt,
+      resolvedAt,
+    )}`,
+    detailsLink,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n');
+
+  return {
+    name: truncateDiscordText(
+      `${incidentSeverityEmoji(incident.impact)} ${incident.name}`,
+      DISCORD_EMBED_FIELD_NAME_LIMIT,
+    ),
+    value: truncateDiscordText(value, DISCORD_EMBED_FIELD_VALUE_LIMIT),
+    inline: false,
+  };
+}
+
+function formatDiscordIncidentLink(
+  shortlink: string | undefined,
+): string | undefined {
+  if (!shortlink) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(shortlink);
+    if (
+      (url.protocol === 'https:' || url.protocol === 'http:') &&
+      url.toString().length <= 512
+    ) {
+      return `[View incident details](${url.toString()})`;
+    }
+  } catch {
+    // Omit malformed Statuspage links from the embed.
+  }
+
+  return undefined;
+}
+
+function truncateDiscordText(value: string, limit: number): string {
+  if (value.length <= limit) {
+    return value;
+  }
+
+  return `${value.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function discordSeverityColor(incidents: RedditIncident[]): number {
+  let highestSeverity: IncidentSeverity | undefined;
+
+  for (const incident of incidents) {
+    const severity = incident.impact.trim().toLowerCase();
+    if (!(severity in INCIDENT_SEVERITY_RANK)) {
+      continue;
+    }
+
+    const normalizedSeverity = severity as IncidentSeverity;
+    if (
+      !highestSeverity ||
+      INCIDENT_SEVERITY_RANK[normalizedSeverity] >
+        INCIDENT_SEVERITY_RANK[highestSeverity]
+    ) {
+      highestSeverity = normalizedSeverity;
+    }
+  }
+
+  return highestSeverity
+    ? DISCORD_COLORS[highestSeverity]
+    : DISCORD_COLORS.unknown;
 }
 
 function formatSlackIncident(incident: RedditIncident): string {
@@ -1181,6 +1531,54 @@ function meetsMinimumSeverity(
   // incident severity. Unknown values remain reportable so a future API change
   // cannot silently suppress an incident.
   return normalizedImpact !== 'none' && normalizedImpact !== 'maintenance';
+}
+
+function createTestIncidents(now: Date): RedditIncident[] {
+  const updatedAt = now.toISOString();
+  const createdAt = new Date(now.getTime() - 15 * 60_000).toISOString();
+
+  return [
+    {
+      id: 'test-incident-minor',
+      name: '[TEST] Minor service degradation',
+      status: 'investigating',
+      impact: 'minor',
+      createdAt,
+      updatedAt,
+      updates: [],
+    },
+    {
+      id: 'test-incident-major',
+      name: '[TEST] Partial service disruption',
+      status: 'investigating',
+      impact: 'major',
+      createdAt,
+      updatedAt,
+      updates: [],
+    },
+    {
+      id: 'test-incident-critical',
+      name: '[TEST] Widespread service outage',
+      status: 'investigating',
+      impact: 'critical',
+      createdAt,
+      updatedAt,
+      updates: [],
+    },
+  ];
+}
+
+async function sendTestChannel(
+  channel: string,
+  send: () => Promise<void>,
+): Promise<NotificationResult> {
+  try {
+    await send();
+    return 'sent';
+  } catch (error) {
+    console.error(`${channel} test notification failed:`, error);
+    return 'failed';
+  }
 }
 
 function activeChannelsFor(
