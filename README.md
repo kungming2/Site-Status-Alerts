@@ -64,6 +64,7 @@ The app requests access to these three domains:
 
 ## Version History
 
+* **0.5.3**: Relicense the project under the MIT License.
 * **0.5.2**: Display Discord incident, resolution, and test notifications as
   compact rich embeds with severity-based colors and structured details.
 * **0.5.1**: Add moderator test outage alerts with severity filtering and
@@ -75,3 +76,7 @@ The app requests access to these three domains:
 * **0.3.3**: Add the app profile icon and align Devvit project dependencies.
 * **0.3.2**: Include approximate incident durations in resolution alerts.
 * **0.3.0**: Implement severity filtering in settings.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
