@@ -1,6 +1,7 @@
 const REDDIT_STATUS_URL =
   'https://www.redditstatus.com/api/v2/incidents/unresolved.json';
 const DISCORD_CONTENT_LIMIT = 2_000;
+const SLACK_TEXT_LIMIT = 4_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const INCIDENT_SEVERITY_RANK = {
   minor: 1,
@@ -35,10 +36,11 @@ export type NotificationResult =
   | 'not-needed'
   | 'sent';
 
-export type NotificationChannel = 'discord' | 'modmail';
+export type NotificationChannel = 'discord' | 'slack' | 'modmail';
 
 export type NotificationConfiguration = {
   discordWebhookUrl?: string;
+  slackWebhookUrl?: string;
   modmailEnabled: boolean;
   minimumIncidentSeverity?: IncidentSeverity;
 };
@@ -116,7 +118,9 @@ export async function checkRedditStatus(
   );
   const minimumIncidentSeverity =
     notificationConfiguration.minimumIncidentSeverity ?? 'major';
-  const webhookUrl = notificationConfiguration.discordWebhookUrl?.trim();
+  const discordWebhookUrl =
+    notificationConfiguration.discordWebhookUrl?.trim();
+  const slackWebhookUrl = notificationConfiguration.slackWebhookUrl?.trim();
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const now = dependencies.now?.() ?? new Date();
   const incidentStore = dependencies.incidentStore;
@@ -181,19 +185,31 @@ export async function checkRedditStatus(
       active: 'not-needed',
       resolved: 'not-needed',
     },
+    slack: {
+      active: 'not-needed',
+      resolved: 'not-needed',
+    },
     modmail: {
       active: 'not-needed',
       resolved: 'not-needed',
     },
   };
-  const validationError = validateDiscordWebhookUrl(webhookUrl);
+  const discordValidationError =
+    validateDiscordWebhookUrl(discordWebhookUrl);
+  const slackValidationError = validateSlackWebhookUrl(slackWebhookUrl);
   const activePending = {
-    discord: webhookUrl
+    discord: discordWebhookUrl
       ? reportableIncidents.filter(
           (incident) =>
             !activeChannelsFor(storedById.get(incident.id)).includes(
               'discord',
             ),
+        )
+      : [],
+    slack: slackWebhookUrl
+      ? reportableIncidents.filter(
+          (incident) =>
+            !activeChannelsFor(storedById.get(incident.id)).includes('slack'),
         )
       : [],
     modmail: notificationConfiguration.modmailEnabled
@@ -206,11 +222,25 @@ export async function checkRedditStatus(
       : [],
   };
 
-  if (newReportableIncidents.length > 0 && !webhookUrl) {
+  if (newReportableIncidents.length > 0 && !discordWebhookUrl) {
     channelNotifications.discord.active = 'not-configured';
-  } else if (activePending.discord.length > 0 && validationError) {
+  } else if (
+    activePending.discord.length > 0 &&
+    discordValidationError
+  ) {
     channelNotifications.discord.active = 'invalid';
-    console.error(`Discord webhook setting is invalid: ${validationError}`);
+    console.error(
+      `Discord webhook setting is invalid: ${discordValidationError}`,
+    );
+  }
+
+  if (newReportableIncidents.length > 0 && !slackWebhookUrl) {
+    channelNotifications.slack.active = 'not-configured';
+  } else if (activePending.slack.length > 0 && slackValidationError) {
+    channelNotifications.slack.active = 'invalid';
+    console.error(
+      `Slack webhook setting is invalid: ${slackValidationError}`,
+    );
   }
 
   if (
@@ -221,7 +251,8 @@ export async function checkRedditStatus(
   }
 
   const sendableActive = uniqueIncidents([
-    ...(validationError ? [] : activePending.discord),
+    ...(discordValidationError ? [] : activePending.discord),
+    ...(slackValidationError ? [] : activePending.slack),
     ...activePending.modmail,
   ]);
   const claimedActive = await claimIncidents(
@@ -238,11 +269,18 @@ export async function checkRedditStatus(
     const discordActive = activePending.discord.filter((incident) =>
       claimedActiveIds.has(incident.id),
     );
+    const slackActive = activePending.slack.filter((incident) =>
+      claimedActiveIds.has(incident.id),
+    );
     const modmailActive = activePending.modmail.filter((incident) =>
       claimedActiveIds.has(incident.id),
     );
 
-    if (!validationError && webhookUrl && discordActive.length > 0) {
+    if (
+      !discordValidationError &&
+      discordWebhookUrl &&
+      discordActive.length > 0
+    ) {
       channelNotifications.discord.active = await notifyActiveChannel(
         'discord',
         discordActive,
@@ -251,8 +289,28 @@ export async function checkRedditStatus(
         now,
         () =>
           sendDiscordAlert(
-            webhookUrl,
+            discordWebhookUrl,
             formatDiscordAlert(discordActive),
+            fetchImpl,
+          ),
+      );
+    }
+
+    if (
+      !slackValidationError &&
+      slackWebhookUrl &&
+      slackActive.length > 0
+    ) {
+      channelNotifications.slack.active = await notifyActiveChannel(
+        'slack',
+        slackActive,
+        storedById,
+        incidentStore,
+        now,
+        () =>
+          sendSlackAlert(
+            slackWebhookUrl,
+            formatSlackAlert(slackActive),
             fetchImpl,
           ),
       );
@@ -285,11 +343,19 @@ export async function checkRedditStatus(
 
   const resolvedPending = {
     discord:
-      webhookUrl && !validationError
+      discordWebhookUrl && !discordValidationError
         ? resolvedStored.filter(
             (stored) =>
               activeChannelsFor(stored).includes('discord') &&
               !resolvedChannelsFor(stored).includes('discord'),
+          )
+        : [],
+    slack:
+      slackWebhookUrl && !slackValidationError
+        ? resolvedStored.filter(
+            (stored) =>
+              activeChannelsFor(stored).includes('slack') &&
+              !resolvedChannelsFor(stored).includes('slack'),
           )
         : [],
     modmail: notificationConfiguration.modmailEnabled
@@ -302,8 +368,8 @@ export async function checkRedditStatus(
   };
 
   if (
-    webhookUrl &&
-    validationError &&
+    discordWebhookUrl &&
+    discordValidationError &&
     resolvedStored.some(
       (stored) =>
         activeChannelsFor(stored).includes('discord') &&
@@ -311,7 +377,24 @@ export async function checkRedditStatus(
     )
   ) {
     channelNotifications.discord.resolved = 'invalid';
-    console.error(`Discord webhook setting is invalid: ${validationError}`);
+    console.error(
+      `Discord webhook setting is invalid: ${discordValidationError}`,
+    );
+  }
+
+  if (
+    slackWebhookUrl &&
+    slackValidationError &&
+    resolvedStored.some(
+      (stored) =>
+        activeChannelsFor(stored).includes('slack') &&
+        !resolvedChannelsFor(stored).includes('slack'),
+    )
+  ) {
+    channelNotifications.slack.resolved = 'invalid';
+    console.error(
+      `Slack webhook setting is invalid: ${slackValidationError}`,
+    );
   }
 
   const claimedResolved = await claimIncidents(
@@ -319,6 +402,7 @@ export async function checkRedditStatus(
     'resolved',
     uniqueIncidents([
       ...resolvedPending.discord.map((stored) => stored.incident),
+      ...resolvedPending.slack.map((stored) => stored.incident),
       ...resolvedPending.modmail.map((stored) => stored.incident),
     ]),
     now,
@@ -331,11 +415,14 @@ export async function checkRedditStatus(
     const discordResolved = resolvedPending.discord.filter((stored) =>
       claimedResolvedIds.has(stored.incident.id),
     );
+    const slackResolved = resolvedPending.slack.filter((stored) =>
+      claimedResolvedIds.has(stored.incident.id),
+    );
     const modmailResolved = resolvedPending.modmail.filter((stored) =>
       claimedResolvedIds.has(stored.incident.id),
     );
 
-    if (webhookUrl && discordResolved.length > 0) {
+    if (discordWebhookUrl && discordResolved.length > 0) {
       channelNotifications.discord.resolved = await notifyResolvedChannel(
         'discord',
         discordResolved,
@@ -343,9 +430,29 @@ export async function checkRedditStatus(
         incidentStore,
         () =>
           sendDiscordAlert(
-            webhookUrl,
+            discordWebhookUrl,
             formatDiscordResolutionAlert(
               discordResolved.map(({ incident, resolvedAt }) => ({
+                incident,
+                resolvedAt,
+              })),
+            ),
+            fetchImpl,
+          ),
+      );
+    }
+
+    if (slackWebhookUrl && slackResolved.length > 0) {
+      channelNotifications.slack.resolved = await notifyResolvedChannel(
+        'slack',
+        slackResolved,
+        storedById,
+        incidentStore,
+        () =>
+          sendSlackAlert(
+            slackWebhookUrl,
+            formatSlackResolutionAlert(
+              slackResolved.map(({ incident, resolvedAt }) => ({
                 incident,
                 resolvedAt,
               })),
@@ -380,7 +487,12 @@ export async function checkRedditStatus(
     const completedResolvedIds = resolvedStored
       .map((stored) => storedById.get(stored.incident.id) ?? stored)
       .filter((stored) =>
-        resolutionComplete(stored, notificationConfiguration, validationError),
+        resolutionComplete(
+          stored,
+          notificationConfiguration,
+          discordValidationError,
+          slackValidationError,
+        ),
       )
       .map((stored) => stored.incident.id);
     await incidentStore.removeActive(completedResolvedIds);
@@ -395,10 +507,12 @@ export async function checkRedditStatus(
   const notifications = {
     active: aggregateNotificationResult(
       channelNotifications.discord.active,
+      channelNotifications.slack.active,
       channelNotifications.modmail.active,
     ),
     resolved: aggregateNotificationResult(
       channelNotifications.discord.resolved,
+      channelNotifications.slack.resolved,
       channelNotifications.modmail.resolved,
     ),
   };
@@ -469,6 +583,23 @@ export async function sendDiscordAlert(
   }
 }
 
+export async function sendSlackAlert(
+  webhookUrl: string,
+  text: string,
+  fetchImpl: Fetch = fetch,
+): Promise<void> {
+  const response = await fetchImpl(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Slack webhook returned HTTP ${response.status}`);
+  }
+}
+
 export function formatDiscordAlert(incidents: RedditIncident[]): string {
   const header = '### ⚠️ Active Reddit Incidents';
   const blocks = incidents.map((incident) =>
@@ -517,6 +648,24 @@ export function formatDiscordResolutionAlert(
   }
 
   return message;
+}
+
+export function formatSlackAlert(incidents: RedditIncident[]): string {
+  return formatSlackMessage(
+    '*⚠️ Active Reddit Incidents*',
+    incidents.map(formatSlackIncident),
+    'incident',
+  );
+}
+
+export function formatSlackResolutionAlert(
+  incidents: Array<RedditIncident | IncidentResolution>,
+): string {
+  return formatSlackMessage(
+    '*✅ Reddit Incidents Resolved*',
+    incidents.map(formatSlackResolvedIncident),
+    'resolved incident',
+  );
 }
 
 export function formatModmailAlert(
@@ -584,6 +733,39 @@ export function validateDiscordWebhookUrl(
   return undefined;
 }
 
+export function validateSlackWebhookUrl(
+  value: string | undefined,
+): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return 'Enter a valid Slack incoming webhook URL.';
+  }
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname.toLowerCase() !== 'hooks.slack.com' ||
+    (url.port !== '' && url.port !== '443') ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.hash !== ''
+  ) {
+    return 'The webhook must be an HTTPS URL on hooks.slack.com.';
+  }
+
+  if (!/^\/services\/[^/]+\/[^/]+\/[^/]+\/?$/.test(url.pathname)) {
+    return 'Enter a Slack incoming webhook URL copied from your app settings.';
+  }
+
+  return undefined;
+}
+
 function normalizeIncident(raw: Record<string, unknown>): RedditIncident {
   const rawUpdates = Array.isArray(raw.incident_updates)
     ? raw.incident_updates
@@ -609,6 +791,84 @@ function normalizeIncident(raw: Record<string, unknown>): RedditIncident {
       createdAt: stringValue(update.created_at),
     })),
   };
+}
+
+function formatSlackMessage(
+  header: string,
+  blocks: string[],
+  omittedLabel: string,
+): string {
+  let message = header;
+
+  for (let index = 0; index < blocks.length; index += 1) {
+    const candidate = `${message}\n${blocks[index]}`;
+    if (candidate.length <= SLACK_TEXT_LIMIT) {
+      message = candidate;
+      continue;
+    }
+
+    const omitted = blocks.length - index;
+    const suffix = `\n\n_${omitted} additional ${omittedLabel}${
+      omitted === 1 ? '' : 's'
+    } omitted to fit Slack's message limit._`;
+    const available = SLACK_TEXT_LIMIT - suffix.length;
+    return `${message.slice(0, available).trimEnd()}${suffix}`;
+  }
+
+  return message;
+}
+
+function formatSlackIncident(incident: RedditIncident): string {
+  return [
+    `• ${incidentSeverityEmoji(incident.impact)} ${formatSlackIncidentTitle(
+      incident,
+    )}`,
+    `  • *Status:* ${escapeSlackText(titleCase(incident.status))} (${escapeSlackText(
+      incident.impact,
+    )})`,
+    `  • *Created:* ${formatSlackTimestamp(incident.createdAt)}`,
+    `  • *Updated:* ${formatSlackTimestamp(incident.updatedAt)}`,
+  ].join('\n');
+}
+
+function formatSlackResolvedIncident(
+  resolution: RedditIncident | IncidentResolution,
+): string {
+  const { incident, resolvedAt } =
+    'incident' in resolution
+      ? resolution
+      : { incident: resolution, resolvedAt: resolution.updatedAt };
+
+  return [
+    `• ${incidentSeverityEmoji(incident.impact)} ${formatSlackIncidentTitle(
+      incident,
+    )}`,
+    '  • *Status:* Resolved',
+    `  • *Previous state:* ${escapeSlackText(
+      titleCase(incident.status),
+    )} (${escapeSlackText(incident.impact)})`,
+    `  • *Approx. duration:* ${escapeSlackText(
+      formatIncidentDuration(incident.createdAt, resolvedAt),
+    )}`,
+  ].join('\n');
+}
+
+function formatSlackIncidentTitle(incident: RedditIncident): string {
+  const label = escapeSlackText(incident.name);
+  if (!incident.shortlink) {
+    return `*${label}*`;
+  }
+
+  try {
+    const url = new URL(incident.shortlink);
+    if (url.protocol === 'https:' || url.protocol === 'http:') {
+      return `*<${url.toString()}|${label}>*`;
+    }
+  } catch {
+    // Fall back to an unlinked title when Statuspage supplies a malformed URL.
+  }
+
+  return `*${label}*`;
 }
 
 function formatIncident(
@@ -709,6 +969,18 @@ function formatDiscordTimestamp(value: string | undefined): string {
   return `<t:${unixTimestamp}:F> (<t:${unixTimestamp}:R>)`;
 }
 
+function formatSlackTimestamp(value: string | undefined): string {
+  const date = parseDate(value);
+  if (!date) {
+    return 'N/A';
+  }
+
+  const unixTimestamp = Math.floor(date.getTime() / 1_000);
+  return `<!date^${unixTimestamp}^{date_long_pretty} at {time}|${escapeSlackText(
+    formatUtc(value),
+  )}>`;
+}
+
 function formatModmailTimestamp(value: string | undefined): string {
   const date = parseDate(value);
   if (!date) {
@@ -725,6 +997,13 @@ function formatModmailTimestamp(value: string | undefined): string {
     `iso=${compactUtc}&p1=1440`;
 
   return `[${formatUtc(value)}](${conversionUrl})`;
+}
+
+function escapeSlackText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
 }
 
 async function claimIncidents(
@@ -839,6 +1118,7 @@ function normalizeNotificationConfiguration(
   if (typeof configuration === 'string' || configuration === undefined) {
     return {
       discordWebhookUrl: configuration,
+      slackWebhookUrl: undefined,
       modmailEnabled: false,
       minimumIncidentSeverity: 'major',
     };
@@ -846,6 +1126,7 @@ function normalizeNotificationConfiguration(
 
   return {
     discordWebhookUrl: configuration.discordWebhookUrl,
+    slackWebhookUrl: configuration.slackWebhookUrl,
     modmailEnabled: configuration.modmailEnabled,
     minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
       configuration.minimumIncidentSeverity,
@@ -854,14 +1135,32 @@ function normalizeNotificationConfiguration(
 }
 
 export function normalizeMinimumIncidentSeverity(
-  value: string | undefined,
+  value: string | readonly string[] | undefined,
 ): IncidentSeverity {
-  const normalized = value?.trim().toLowerCase();
+  const normalized = selectedIncidentSeverity(value);
   return normalized === 'minor' ||
     normalized === 'major' ||
     normalized === 'critical'
     ? normalized
     : 'major';
+}
+
+export function validateMinimumIncidentSeverity(
+  value: string | readonly string[] | undefined,
+): string | undefined {
+  const normalized = selectedIncidentSeverity(value);
+  return normalized === 'minor' ||
+    normalized === 'major' ||
+    normalized === 'critical'
+    ? undefined
+    : 'Choose a minimum incident severity.';
+}
+
+function selectedIncidentSeverity(
+  value: string | readonly string[] | undefined,
+): string | undefined {
+  const selectedValue = typeof value === 'string' ? value : value?.[0];
+  return selectedValue?.trim().toLowerCase();
 }
 
 function meetsMinimumSeverity(
@@ -918,15 +1217,27 @@ function resolutionComplete(
   stored: StoredIncident,
   configuration: NotificationConfiguration,
   discordValidationError: string | undefined,
+  slackValidationError: string | undefined,
 ): boolean {
   const activeChannels = activeChannelsFor(stored);
   const resolvedChannels = resolvedChannelsFor(stored);
-  const webhookConfigured = Boolean(configuration.discordWebhookUrl?.trim());
+  const discordConfigured = Boolean(
+    configuration.discordWebhookUrl?.trim(),
+  );
+  const slackConfigured = Boolean(configuration.slackWebhookUrl?.trim());
 
   if (
-    webhookConfigured &&
+    discordConfigured &&
     activeChannels.includes('discord') &&
     (discordValidationError || !resolvedChannels.includes('discord'))
+  ) {
+    return false;
+  }
+
+  if (
+    slackConfigured &&
+    activeChannels.includes('slack') &&
+    (slackValidationError || !resolvedChannels.includes('slack'))
   ) {
     return false;
   }
@@ -957,7 +1268,14 @@ function aggregateNotificationResult(
 }
 
 function channelLabel(channel: NotificationChannel): string {
-  return channel === 'discord' ? 'Discord' : 'Modmail';
+  switch (channel) {
+    case 'discord':
+      return 'Discord';
+    case 'slack':
+      return 'Slack';
+    case 'modmail':
+      return 'Modmail';
+  }
 }
 
 async function releaseClaimsSafely(

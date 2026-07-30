@@ -176,7 +176,12 @@ function isNotificationChannelArray(
 ): value is NotificationChannel[] {
   return (
     Array.isArray(value) &&
-    value.every((channel) => channel === 'discord' || channel === 'modmail')
+    value.every(
+      (channel) =>
+        channel === 'discord' ||
+        channel === 'slack' ||
+        channel === 'modmail',
+    )
   );
 }
 

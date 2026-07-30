@@ -18,7 +18,8 @@
       "enable": true,
       "domains": [
         "www.redditstatus.com",
-        "discord.com"
+        "discord.com",
+        "hooks.slack.com"
       ]
     }
   },
@@ -52,6 +53,7 @@
             "type": "select",
             "label": "Minimum incident severity",
             "helpText": "Incidents below this Statuspage severity are ignored. Records with no severity and maintenance notices are also ignored.",
+            "validationEndpoint": "/internal/settings/validate-minimum-incident-severity",
             "options": [
               {
                 "label": "Minor or higher",
@@ -82,6 +84,21 @@
             "placeholder": "https://discord.com/api/webhooks/...",
             "defaultValue": "",
             "validationEndpoint": "/internal/settings/validate-discord-webhook"
+          }
+        }
+      },
+      "slack-notifications": {
+        "type": "group",
+        "label": "Slack notifications",
+        "helpText": "Configure where qualifying active Reddit incidents should be reported.",
+        "fields": {
+          "slackWebhookUrl": {
+            "type": "string",
+            "label": "Slack incoming webhook URL",
+            "helpText": "Paste an incoming webhook URL copied from your Slack app's settings.",
+            "placeholder": "https://hooks.slack.com/services/...",
+            "defaultValue": "",
+            "validationEndpoint": "/internal/settings/validate-slack-webhook"
           }
         }
       },

@@ -17,10 +17,13 @@ import {
   checkRedditStatus,
   normalizeMinimumIncidentSeverity,
   validateDiscordWebhookUrl,
+  validateMinimumIncidentSeverity,
+  validateSlackWebhookUrl,
   type StatusCheckResult,
 } from './status.ts';
 
 const DISCORD_WEBHOOK_SETTING = 'discordWebhookUrl';
+const SLACK_WEBHOOK_SETTING = 'slackWebhookUrl';
 const MODMAIL_NOTIFICATIONS_SETTING = 'modmailNotificationsEnabled';
 const MINIMUM_INCIDENT_SEVERITY_SETTING = 'minimumIncidentSeverity';
 
@@ -66,6 +69,12 @@ async function route(
       return;
     case '/internal/settings/validate-discord-webhook':
       writeJson(response, 200, await handleWebhookValidation(request));
+      return;
+    case '/internal/settings/validate-slack-webhook':
+      writeJson(response, 200, await handleSlackWebhookValidation(request));
+      return;
+    case '/internal/settings/validate-minimum-incident-severity':
+      writeJson(response, 200, await handleMinimumSeverityValidation(request));
       return;
     default:
       writeJson(response, 404, { error: 'Not found', status: 404 });
@@ -117,18 +126,49 @@ async function handleWebhookValidation(
     : { success: true };
 }
 
+async function handleMinimumSeverityValidation(
+  request: IncomingMessage,
+): Promise<SettingsValidationResponse> {
+  const { value } =
+    await readJson<SettingsValidationRequest<string[]>>(request);
+  const validationError = validateMinimumIncidentSeverity(value);
+
+  return validationError
+    ? { success: false, error: validationError }
+    : { success: true };
+}
+
+async function handleSlackWebhookValidation(
+  request: IncomingMessage,
+): Promise<SettingsValidationResponse> {
+  const { value } =
+    await readJson<SettingsValidationRequest<string>>(request);
+  const validationError = validateSlackWebhookUrl(value);
+
+  return validationError
+    ? { success: false, error: validationError }
+    : { success: true };
+}
+
 async function runConfiguredCheck(): Promise<StatusCheckResult> {
-  const [webhookUrl, modmailEnabled, minimumIncidentSeverity] =
+  const [
+    discordWebhookUrl,
+    slackWebhookUrl,
+    modmailEnabled,
+    minimumIncidentSeverity,
+  ] =
     await Promise.all([
       settings.get<string>(DISCORD_WEBHOOK_SETTING),
+      settings.get<string>(SLACK_WEBHOOK_SETTING),
       settings.get<boolean>(MODMAIL_NOTIFICATIONS_SETTING),
-      settings.get<string>(MINIMUM_INCIDENT_SEVERITY_SETTING),
+      settings.get<string[]>(MINIMUM_INCIDENT_SEVERITY_SETTING),
     ]);
   let subredditPromise: ReturnType<typeof reddit.getCurrentSubreddit> | undefined;
 
   return checkRedditStatus(
     {
-      discordWebhookUrl: webhookUrl?.trim(),
+      discordWebhookUrl: discordWebhookUrl?.trim(),
+      slackWebhookUrl: slackWebhookUrl?.trim(),
       modmailEnabled: modmailEnabled === true,
       minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
         minimumIncidentSeverity,
@@ -171,6 +211,7 @@ function manualCheckMessage(result: StatusCheckResult): string {
   } else if (
     newCount === 0 &&
     result.channelNotifications.discord.active === 'not-needed' &&
+    result.channelNotifications.slack.active === 'not-needed' &&
     result.channelNotifications.modmail.active === 'not-needed'
   ) {
     messages.push(
@@ -210,6 +251,8 @@ function scheduledCheckMessage(result: StatusCheckResult): string {
     `${result.resolvedIncidents.length} resolved;`,
     `Discord active=${result.channelNotifications.discord.active},`,
     `resolved=${result.channelNotifications.discord.resolved};`,
+    `Slack active=${result.channelNotifications.slack.active},`,
+    `resolved=${result.channelNotifications.slack.resolved};`,
     `Modmail active=${result.channelNotifications.modmail.active},`,
     `resolved=${result.channelNotifications.modmail.resolved}.`,
   ].join(' ');
@@ -262,7 +305,11 @@ function notificationSummary(
     parts.push(`${failed} delivery failed and will be retried`);
   }
   if (invalid) {
-    parts.push('the configured Discord webhook URL is invalid');
+    parts.push(
+      `the configured ${invalid} webhook URL${
+        invalid.includes(' and ') ? 's are' : ' is'
+      } invalid`,
+    );
   }
 
   if (parts.length > 0) {
@@ -271,9 +318,10 @@ function notificationSummary(
 
   const allNotConfigured =
     notifications.discord[kind] === 'not-configured' &&
+    notifications.slack[kind] === 'not-configured' &&
     notifications.modmail[kind] === 'not-configured';
   if (allNotConfigured) {
-    return 'configure a Discord webhook or enable Modmail notifications to receive alerts';
+    return 'configure a Discord or Slack webhook, or enable Modmail notifications to receive alerts';
   }
 
   return 'no notification was needed';
@@ -286,10 +334,15 @@ function channelNamesForResult(
 ): string {
   const channels = [
     notifications.discord[kind] === result ? 'Discord' : undefined,
+    notifications.slack[kind] === result ? 'Slack' : undefined,
     notifications.modmail[kind] === result ? 'Modmail' : undefined,
   ].filter((channel): channel is string => channel !== undefined);
 
-  return channels.join(' and ');
+  if (channels.length < 3) {
+    return channels.join(' and ');
+  }
+
+  return `${channels.slice(0, -1).join(', ')}, and ${channels.at(-1)}`;
 }
 
 function errorMessage(error: unknown): string {

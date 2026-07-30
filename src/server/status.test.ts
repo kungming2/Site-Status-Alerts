@@ -8,8 +8,13 @@ import {
   formatDiscordResolutionAlert,
   formatModmailAlert,
   formatModmailResolutionAlert,
+  formatSlackAlert,
+  formatSlackResolutionAlert,
   normalizeMinimumIncidentSeverity,
+  sendSlackAlert,
   validateDiscordWebhookUrl,
+  validateMinimumIncidentSeverity,
+  validateSlackWebhookUrl,
   type IncidentClaimKind,
   type IncidentStore,
   type ModmailNotification,
@@ -648,6 +653,68 @@ test('dual-channel retries do not resend the channel that already succeeded', as
   assert.equal(incidentStore.active.size, 0);
 });
 
+test('Slack can be the only notification channel for the full incident lifecycle', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  const incidentStore = new MemoryIncidentStore();
+  let feed: Record<string, unknown>[] = [
+    {
+      id: majorIncident.id,
+      name: majorIncident.name,
+      status: majorIncident.status,
+      impact: majorIncident.impact,
+      created_at: majorIncident.createdAt,
+      updated_at: majorIncident.updatedAt,
+      shortlink: majorIncident.shortlink,
+    },
+  ];
+  const slackMessages: string[] = [];
+  const resolvedAt = '2026-07-29T21:45:00.000Z';
+  const webhookUrl =
+    'https://hooks.slack.com/services/T00000000/B00000000/secret-token';
+  const fakeFetch: typeof fetch = async (input, init) => {
+    if (String(input).includes('redditstatus.com')) {
+      return new Response(JSON.stringify({ incidents: feed }), { status: 200 });
+    }
+
+    assert.equal(String(input), webhookUrl);
+    slackMessages.push(
+      (JSON.parse(String(init?.body)) as { text: string }).text,
+    );
+    return new Response('ok', { status: 200 });
+  };
+  const configuration = {
+    slackWebhookUrl: webhookUrl,
+    modmailEnabled: false,
+  };
+  const dependencies: StatusCheckDependencies = {
+    incidentStore,
+    fetchImpl: fakeFetch,
+    now: () => new Date(resolvedAt),
+  };
+
+  const first = await checkRedditStatus(configuration, dependencies);
+  const ongoing = await checkRedditStatus(configuration, dependencies);
+
+  assert.equal(first.channelNotifications.slack.active, 'sent');
+  assert.equal(first.channelNotifications.discord.active, 'not-configured');
+  assert.equal(ongoing.channelNotifications.slack.active, 'not-needed');
+  assert.deepEqual(
+    incidentStore.active.get(majorIncident.id)?.activeNotificationChannels,
+    ['slack'],
+  );
+  assert.deepEqual(slackMessages, [formatSlackAlert([majorIncident])]);
+
+  feed = [];
+  const resolved = await checkRedditStatus(configuration, dependencies);
+
+  assert.equal(resolved.channelNotifications.slack.resolved, 'sent');
+  assert.equal(incidentStore.active.size, 0);
+  assert.deepEqual(slackMessages, [
+    formatSlackAlert([majorIncident]),
+    formatSlackResolutionAlert([{ incident: majorIncident, resolvedAt }]),
+  ]);
+});
+
 test('formatDiscordAlert includes incident details', () => {
   const message = formatDiscordAlert([majorIncident]);
 
@@ -675,7 +742,41 @@ test('formatDiscordResolutionAlert includes the previous incident state', () => 
   assert.match(message, /Approx\. duration:\*\* 1 hour 45 minutes/);
 });
 
-test('Discord and Modmail use an emoji for each incident severity', () => {
+test('formatSlackAlert uses mrkdwn links, escaped text, and localized timestamps', () => {
+  const message = formatSlackAlert([
+    {
+      ...majorIncident,
+      name: 'API <danger> & <!channel>',
+    },
+  ]);
+
+  assert.match(message, /\*⚠️ Active Reddit Incidents\*/);
+  assert.match(
+    message,
+    /<https:\/\/redditstatus\.com\/example\|API &lt;danger&gt; &amp; &lt;!channel&gt;>/,
+  );
+  assert.doesNotMatch(message, /<!channel>/);
+  assert.match(
+    message,
+    /<!date\^1785355200\^\{date_long_pretty\} at \{time\}\|2026-07-29 20:00:00 UTC>/,
+  );
+});
+
+test('formatSlackResolutionAlert includes the previous incident state', () => {
+  const message = formatSlackResolutionAlert([
+    {
+      incident: majorIncident,
+      resolvedAt: '2026-07-29T21:45:00.000Z',
+    },
+  ]);
+
+  assert.match(message, /Reddit Incidents Resolved/);
+  assert.match(message, /\*Status:\* Resolved/);
+  assert.match(message, /\*Previous state:\* Investigating \(major\)/);
+  assert.match(message, /\*Approx\. duration:\* 1 hour 45 minutes/);
+});
+
+test('Discord, Slack, and Modmail use an emoji for each incident severity', () => {
   const incidents = [
     { ...majorIncident, id: 'minor', impact: 'minor' },
     { ...majorIncident, id: 'major', impact: 'major' },
@@ -683,9 +784,10 @@ test('Discord and Modmail use an emoji for each incident severity', () => {
     { ...majorIncident, id: 'unknown', impact: 'unknown' },
   ];
   const discordMessage = formatDiscordAlert(incidents);
+  const slackMessage = formatSlackAlert(incidents);
   const modmailMessage = formatModmailAlert(incidents).bodyMarkdown;
 
-  for (const message of [discordMessage, modmailMessage]) {
+  for (const message of [discordMessage, slackMessage, modmailMessage]) {
     assert.match(message, /🟡/);
     assert.match(message, /🟠/);
     assert.match(message, /🔴/);
@@ -729,9 +831,72 @@ test('validateDiscordWebhookUrl rejects non-Discord and malformed URLs', () => {
   );
 });
 
+test('validateSlackWebhookUrl accepts copied Slack URLs and blanks', () => {
+  assert.equal(validateSlackWebhookUrl(undefined), undefined);
+  assert.equal(validateSlackWebhookUrl(''), undefined);
+  assert.equal(
+    validateSlackWebhookUrl(
+      'https://hooks.slack.com/services/T00000000/B00000000/secret-token',
+    ),
+    undefined,
+  );
+});
+
+test('validateSlackWebhookUrl rejects non-Slack and malformed URLs', () => {
+  assert.match(
+    validateSlackWebhookUrl(
+      'https://example.com/services/T00000000/B00000000/token',
+    ) ?? '',
+    /hooks\.slack\.com/,
+  );
+  assert.match(
+    validateSlackWebhookUrl('https://hooks.slack.com/workflows/123') ?? '',
+    /incoming webhook/i,
+  );
+});
+
+test('sendSlackAlert posts the required JSON text payload and reports failures', async () => {
+  const webhookUrl =
+    'https://hooks.slack.com/services/T00000000/B00000000/secret-token';
+  let requestBody = '';
+  const successFetch: typeof fetch = async (input, init) => {
+    assert.equal(String(input), webhookUrl);
+    assert.equal(init?.method, 'POST');
+    assert.deepEqual(init?.headers, { 'Content-Type': 'application/json' });
+    requestBody = String(init?.body);
+    return new Response('ok', { status: 200 });
+  };
+
+  await sendSlackAlert(webhookUrl, '*Test alert*', successFetch);
+  assert.deepEqual(JSON.parse(requestBody), { text: '*Test alert*' });
+
+  await assert.rejects(
+    sendSlackAlert(
+      webhookUrl,
+      '*Test alert*',
+      async () => new Response('invalid_token', { status: 403 }),
+    ),
+    /Slack webhook returned HTTP 403/,
+  );
+});
+
 test('normalizeMinimumIncidentSeverity uses a migration-safe major default', () => {
   assert.equal(normalizeMinimumIncidentSeverity(undefined), 'major');
   assert.equal(normalizeMinimumIncidentSeverity(''), 'major');
+  assert.equal(normalizeMinimumIncidentSeverity([]), 'major');
   assert.equal(normalizeMinimumIncidentSeverity('unexpected'), 'major');
   assert.equal(normalizeMinimumIncidentSeverity(' CRITICAL '), 'critical');
+  assert.equal(normalizeMinimumIncidentSeverity([' CRITICAL ']), 'critical');
+});
+
+test('validateMinimumIncidentSeverity requires a recognized selection', () => {
+  assert.match(validateMinimumIncidentSeverity(undefined) ?? '', /choose/i);
+  assert.match(validateMinimumIncidentSeverity([]) ?? '', /choose/i);
+  assert.match(validateMinimumIncidentSeverity(['']) ?? '', /choose/i);
+  assert.match(
+    validateMinimumIncidentSeverity(['unexpected']) ?? '',
+    /choose/i,
+  );
+  assert.equal(validateMinimumIncidentSeverity(['major']), undefined);
+  assert.equal(validateMinimumIncidentSeverity([' CRITICAL ']), undefined);
 });

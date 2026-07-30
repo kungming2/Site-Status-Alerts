@@ -86,8 +86,8 @@ test('Redis incident store saves, reads, and removes active incidents', async ()
   const storedWithChannels = {
     ...stored,
     resolvedAt: '2026-07-29T21:45:00.000Z',
-    activeNotificationChannels: ['discord', 'modmail'] as const,
-    resolvedNotificationChannels: ['discord'] as const,
+    activeNotificationChannels: ['discord', 'slack', 'modmail'] as const,
+    resolvedNotificationChannels: ['discord', 'slack'] as const,
   };
   await store.saveActive([
     {
