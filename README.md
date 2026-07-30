@@ -52,5 +52,6 @@ The app requests access to these exact domains:
 
 ## Version History
 
+* **0.3.3**: Add the app profile icon and align Devvit project dependencies.
 * **0.3.2**: Include approximate incident durations in resolution alerts.
 * **0.3.0**: Implement severity filtering in settings.

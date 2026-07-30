@@ -1,6 +1,6 @@
 {
   "name": "site-status-alerts",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "A Devvit moderator tool that reports Reddit site incidents through Discord and native Modmail.",
   "private": true,
   "type": "module",
@@ -21,7 +21,7 @@
     "@types/node": "20.14.12",
     "devvit": "0.13.10",
     "esbuild": "0.25.9",
-    "typescript": "^5.5.3"
+    "typescript": "5.8.3"
   },
   "engines": {
     "node": ">=22.6"
