@@ -12,7 +12,7 @@ const ACTIVE_INCIDENTS_KEY = 'site-status-alerts:active-incidents:v1';
 const INCIDENT_CLAIMS_KEY = 'site-status-alerts:incident-claims:v1';
 const STALE_CLAIM_MS = 5 * 60 * 1_000;
 
-type RedisIncidentClient = Pick<
+export type RedisIncidentClient = Pick<
   RedisClient,
   'hDel' | 'hGet' | 'hGetAll' | 'hSet' | 'hSetNX'
 >;
@@ -137,6 +137,8 @@ function parseStoredIncident(value: string): StoredIncident | undefined {
     }
 
     if (
+      (parsed.resolvedAt !== undefined &&
+        typeof parsed.resolvedAt !== 'string') ||
       (parsed.activeNotificationChannels !== undefined &&
         !isNotificationChannelArray(parsed.activeNotificationChannels)) ||
       (parsed.resolvedNotificationChannels !== undefined &&
@@ -148,6 +150,9 @@ function parseStoredIncident(value: string): StoredIncident | undefined {
     return {
       alertedAt: parsed.alertedAt,
       incident: incident as RedditIncident,
+      ...(parsed.resolvedAt !== undefined
+        ? { resolvedAt: parsed.resolvedAt }
+        : {}),
       ...(parsed.activeNotificationChannels !== undefined
         ? {
             activeNotificationChannels:

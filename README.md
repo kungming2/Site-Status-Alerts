@@ -31,7 +31,7 @@ Please note that the app has no way of notifying moderators if modmail
 notifications are turned off *and* there is no entered Discord Webhook.
 
 Discord renders incident timestamps in each viewer's locale and time zone. Modmail
-keeps the UTC timestamp visible and links it to Timeanddate's local-time
+keeps the UTC timestamp visible and links it to [Timeanddate](https://www.timeanddate.com/)'s local-time
 conversion page.
 
 ## Data Storage
@@ -52,4 +52,5 @@ The app requests access to these exact domains:
 
 ## Version History
 
-* **0.3.0**: Implement severity filtering in settings. 
+* **0.3.2**: Include approximate incident durations in resolution alerts.
+* **0.3.0**: Implement severity filtering in settings.

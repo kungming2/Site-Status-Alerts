@@ -12,9 +12,12 @@ import {
   validateDiscordWebhookUrl,
   type IncidentClaimKind,
   type IncidentStore,
+  type ModmailNotification,
   type RedditIncident,
   type StoredIncident,
 } from './status.ts';
+
+type StatusCheckDependencies = Parameters<typeof checkRedditStatus>[1];
 
 const majorIncident: RedditIncident = {
   id: 'incident-major-1',
@@ -68,6 +71,25 @@ class MemoryIncidentStore implements IncidentStore {
       this.active.delete(incidentId);
     }
   }
+}
+
+function createStatusAndDiscordFetch(
+  getIncidents: () => Record<string, unknown>[],
+  discordMessages: string[],
+): typeof fetch {
+  return async (input, init) => {
+    if (String(input).includes('redditstatus.com')) {
+      return new Response(
+        JSON.stringify({ incidents: getIncidents() }),
+        { status: 200 },
+      );
+    }
+
+    discordMessages.push(
+      (JSON.parse(String(init?.body)) as { content: string }).content,
+    );
+    return new Response(null, { status: 204 });
+  };
 }
 
 test('fetchRedditIncidents normalizes the Statuspage response', async () => {
@@ -305,24 +327,24 @@ test('checkRedditStatus alerts once, stays quiet while active, and alerts when r
     },
   ];
   const discordMessages: string[] = [];
-  const fakeFetch: typeof fetch = async (input, init) => {
-    if (String(input).includes('redditstatus.com')) {
-      return new Response(JSON.stringify({ incidents: feed }), { status: 200 });
-    }
-
-    discordMessages.push(
-      (JSON.parse(String(init?.body)) as { content: string }).content,
-    );
-    return new Response(null, { status: 204 });
-  };
+  const resolvedAt = '2026-07-29T21:45:00.000Z';
+  const fakeFetch = createStatusAndDiscordFetch(() => feed, discordMessages);
 
   const first = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    {
+      incidentStore,
+      fetchImpl: fakeFetch,
+      now: () => new Date(resolvedAt),
+    },
   );
   const ongoing = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    {
+      incidentStore,
+      fetchImpl: fakeFetch,
+      now: () => new Date(resolvedAt),
+    },
   );
 
   assert.equal(first.notifications.active, 'sent');
@@ -334,11 +356,19 @@ test('checkRedditStatus alerts once, stays quiet while active, and alerts when r
   feed = [];
   const resolved = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    {
+      incidentStore,
+      fetchImpl: fakeFetch,
+      now: () => new Date(resolvedAt),
+    },
   );
   const afterResolution = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    {
+      incidentStore,
+      fetchImpl: fakeFetch,
+      now: () => new Date(resolvedAt),
+    },
   );
 
   assert.equal(resolved.resolvedIncidents.length, 1);
@@ -348,7 +378,7 @@ test('checkRedditStatus alerts once, stays quiet while active, and alerts when r
   assert.equal(discordMessages.length, 2);
   assert.equal(
     discordMessages[1],
-    formatDiscordResolutionAlert([majorIncident]),
+    formatDiscordResolutionAlert([{ incident: majorIncident, resolvedAt }]),
   );
 });
 
@@ -401,29 +431,47 @@ test('checkRedditStatus retains resolved incidents when the resolution alert fai
     },
   ]);
   let discordStatus = 429;
-  const fakeFetch: typeof fetch = async (input) => {
+  let now = new Date('2026-07-29T21:45:00.000Z');
+  const discordMessages: string[] = [];
+  const fakeFetch: typeof fetch = async (input, init) => {
     if (String(input).includes('redditstatus.com')) {
       return new Response(JSON.stringify({ incidents: [] }), { status: 200 });
     }
+    discordMessages.push(
+      (JSON.parse(String(init?.body)) as { content: string }).content,
+    );
     return new Response(null, { status: discordStatus });
+  };
+  const dependencies = {
+    incidentStore,
+    fetchImpl: fakeFetch,
+    now: () => now,
   };
 
   const failed = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    dependencies,
   );
 
   assert.equal(failed.notifications.resolved, 'failed');
   assert.equal(incidentStore.active.size, 1);
+  assert.equal(
+    incidentStore.active.get(majorIncident.id)?.resolvedAt,
+    '2026-07-29T21:45:00.000Z',
+  );
 
   discordStatus = 204;
+  now = new Date('2026-07-29T22:45:00.000Z');
   const retried = await checkRedditStatus(
     'https://discord.com/api/webhooks/123/token',
-    { incidentStore, fetchImpl: fakeFetch },
+    dependencies,
   );
 
   assert.equal(retried.notifications.resolved, 'sent');
   assert.equal(incidentStore.active.size, 0);
+  assert.equal(discordMessages.length, 2);
+  assert.equal(discordMessages[0], discordMessages[1]);
+  assert.match(discordMessages[1] ?? '', /1 hour 45 minutes/);
 });
 
 test('concurrent checks claim a new incident only once', async (t) => {
@@ -484,17 +532,16 @@ test('Modmail can be the only notification channel for the full incident lifecyc
     subject: string;
     bodyMarkdown: string;
   }> = [];
+  const resolvedAt = '2026-07-29T21:45:00.000Z';
   const fakeFetch: typeof fetch = async (input) => {
     assert.match(String(input), /redditstatus\.com/);
     return new Response(JSON.stringify({ incidents: feed }), { status: 200 });
   };
-  const dependencies = {
+  const dependencies: StatusCheckDependencies = {
     incidentStore,
     fetchImpl: fakeFetch,
-    sendModmailNotification: async (notification: {
-      subject: string;
-      bodyMarkdown: string;
-    }) => {
+    now: () => new Date(resolvedAt),
+    sendModmailNotification: async (notification: ModmailNotification) => {
       modmailNotifications.push(notification);
     },
   };
@@ -528,7 +575,7 @@ test('Modmail can be the only notification channel for the full incident lifecyc
   assert.equal(incidentStore.active.size, 0);
   assert.deepEqual(modmailNotifications, [
     formatModmailAlert([majorIncident]),
-    formatModmailResolutionAlert([majorIncident]),
+    formatModmailResolutionAlert([{ incident: majorIncident, resolvedAt }]),
   ]);
 });
 
@@ -547,25 +594,11 @@ test('dual-channel retries do not resend the channel that already succeeded', as
   const discordMessages: string[] = [];
   const modmailSubjects: string[] = [];
   let failNextModmail = true;
-  const fakeFetch: typeof fetch = async (input, init) => {
-    if (String(input).includes('redditstatus.com')) {
-      return new Response(JSON.stringify({ incidents: feed }), { status: 200 });
-    }
-
-    discordMessages.push(
-      (JSON.parse(String(init?.body)) as { content: string }).content,
-    );
-    return new Response(null, { status: 204 });
-  };
-  const dependencies = {
+  const fakeFetch = createStatusAndDiscordFetch(() => feed, discordMessages);
+  const dependencies: StatusCheckDependencies = {
     incidentStore,
     fetchImpl: fakeFetch,
-    sendModmailNotification: async ({
-      subject,
-    }: {
-      subject: string;
-      bodyMarkdown: string;
-    }) => {
+    sendModmailNotification: async ({ subject }: ModmailNotification) => {
       modmailSubjects.push(subject);
       if (failNextModmail) {
         failNextModmail = false;
@@ -627,13 +660,19 @@ test('formatDiscordAlert includes incident details', () => {
 });
 
 test('formatDiscordResolutionAlert includes the previous incident state', () => {
-  const message = formatDiscordResolutionAlert([majorIncident]);
+  const message = formatDiscordResolutionAlert([
+    {
+      incident: majorIncident,
+      resolvedAt: '2026-07-29T21:45:00.000Z',
+    },
+  ]);
 
   assert.match(message, /Reddit Incidents Resolved/);
   assert.match(message, /🟠/);
   assert.match(message, /Elevated API errors/);
   assert.match(message, /Status:\*\* Resolved/);
   assert.match(message, /Previous state:\*\* Investigating \(major\)/);
+  assert.match(message, /Approx\. duration:\*\* 1 hour 45 minutes/);
 });
 
 test('Discord and Modmail use an emoji for each incident severity', () => {
@@ -659,11 +698,11 @@ test('Modmail links UTC timestamps to Timeanddate local conversions', () => {
 
   assert.match(
     message,
-    /\[2026-07-29 20:00:00 UTC\]\(https:\/\/www\.timeanddate\.com\/worldclock\/fixedtime\.html\?iso=20260729T200000&p1=1440\)/,
+    /\[2026-07-29 20:00:00 UTC]\(https:\/\/www\.timeanddate\.com\/worldclock\/fixedtime\.html\?iso=20260729T200000&p1=1440\)/,
   );
   assert.match(
     message,
-    /\[2026-07-29 20:30:00 UTC\]\(https:\/\/www\.timeanddate\.com\/worldclock\/fixedtime\.html\?iso=20260729T203000&p1=1440\)/,
+    /\[2026-07-29 20:30:00 UTC]\(https:\/\/www\.timeanddate\.com\/worldclock\/fixedtime\.html\?iso=20260729T203000&p1=1440\)/,
   );
 });
 

@@ -74,8 +74,14 @@ export type StatusCheckResult = {
 export type StoredIncident = {
   incident: RedditIncident;
   alertedAt: string;
+  resolvedAt?: string;
   activeNotificationChannels?: NotificationChannel[];
   resolvedNotificationChannels?: NotificationChannel[];
+};
+
+export type IncidentResolution = {
+  incident: RedditIncident;
+  resolvedAt?: string;
 };
 
 export type IncidentClaimKind = 'active' | 'resolved';
@@ -141,9 +147,19 @@ export async function checkRedditStatus(
   const ongoingReportableIncidents = reportableIncidents.filter((incident) =>
     storedById.has(incident.id),
   );
-  const resolvedIncidents = storedIncidents
+  const resolvedStored = storedIncidents
     .filter((stored) => !incidentById.has(stored.incident.id))
-    .map((stored) => stored.incident);
+    .map((stored) => ({
+      ...stored,
+      resolvedAt: stored.resolvedAt ?? now.toISOString(),
+    }));
+  const resolvedIncidents = resolvedStored.map((stored) => stored.incident);
+  if (resolvedStored.length > 0) {
+    await incidentStore.saveActive(resolvedStored);
+    for (const stored of resolvedStored) {
+      storedById.set(stored.incident.id, stored);
+    }
+  }
 
   const refreshedStoredIncidents = storedIncidents.flatMap((stored) => {
     const current = incidentById.get(stored.incident.id);
@@ -267,10 +283,6 @@ export async function checkRedditStatus(
     );
   }
 
-  const resolvedStored = resolvedIncidents.flatMap((incident) => {
-    const stored = storedById.get(incident.id);
-    return stored ? [stored] : [];
-  });
   const resolvedPending = {
     discord:
       webhookUrl && !validationError
@@ -333,7 +345,10 @@ export async function checkRedditStatus(
           sendDiscordAlert(
             webhookUrl,
             formatDiscordResolutionAlert(
-              discordResolved.map((stored) => stored.incident),
+              discordResolved.map(({ incident, resolvedAt }) => ({
+                incident,
+                resolvedAt,
+              })),
             ),
             fetchImpl,
           ),
@@ -352,7 +367,10 @@ export async function checkRedditStatus(
           }
           await dependencies.sendModmailNotification(
             formatModmailResolutionAlert(
-              modmailResolved.map((stored) => stored.incident),
+              modmailResolved.map(({ incident, resolvedAt }) => ({
+                incident,
+                resolvedAt,
+              })),
             ),
           );
         },
@@ -477,7 +495,7 @@ export function formatDiscordAlert(incidents: RedditIncident[]): string {
 }
 
 export function formatDiscordResolutionAlert(
-  incidents: RedditIncident[],
+  incidents: Array<RedditIncident | IncidentResolution>,
 ): string {
   const header = '### ✅ Reddit Incidents Resolved';
   const blocks = incidents.map(formatResolvedIncident);
@@ -519,7 +537,7 @@ export function formatModmailAlert(
 }
 
 export function formatModmailResolutionAlert(
-  incidents: RedditIncident[],
+  incidents: Array<RedditIncident | IncidentResolution>,
 ): ModmailNotification {
   return {
     subject: `Reddit site status: ${incidents.length} incident${
@@ -610,7 +628,13 @@ function formatIncident(
   ].join('\n');
 }
 
-function formatResolvedIncident(incident: RedditIncident): string {
+function formatResolvedIncident(
+  resolution: RedditIncident | IncidentResolution,
+): string {
+  const { incident, resolvedAt } =
+    'incident' in resolution
+      ? resolution
+      : { incident: resolution, resolvedAt: resolution.updatedAt };
   const title = incident.shortlink
     ? `**[${incident.name}](${incident.shortlink})**`
     : `**${incident.name}**`;
@@ -620,7 +644,46 @@ function formatResolvedIncident(incident: RedditIncident): string {
     `- ${severityEmoji} ${title}`,
     '  - **Status:** Resolved',
     `  - **Previous state:** ${titleCase(incident.status)} (${incident.impact})`,
+    `  - **Approx. duration:** ${formatIncidentDuration(
+      incident.createdAt,
+      resolvedAt,
+    )}`,
   ].join('\n');
+}
+
+function formatIncidentDuration(
+  createdAt: string | undefined,
+  resolvedAt: string | undefined,
+): string {
+  const created = parseDate(createdAt);
+  const resolved = parseDate(resolvedAt);
+  if (!created || !resolved || resolved < created) {
+    return 'Unknown';
+  }
+
+  const elapsedMilliseconds = resolved.getTime() - created.getTime();
+  if (elapsedMilliseconds < 60_000) {
+    return 'Less than 1 minute';
+  }
+
+  let remainingMinutes = Math.floor(elapsedMilliseconds / 60_000);
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  remainingMinutes -= days * 24 * 60;
+  const hours = Math.floor(remainingMinutes / 60);
+  const minutes = remainingMinutes - hours * 60;
+  const parts: string[] = [];
+
+  if (days > 0) {
+    parts.push(`${days} day${days === 1 ? '' : 's'}`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+  }
+  if (minutes > 0) {
+    parts.push(`${minutes} minute${minutes === 1 ? '' : 's'}`);
+  }
+
+  return parts.join(' ');
 }
 
 function incidentSeverityEmoji(impact: string): string {
@@ -690,11 +753,17 @@ async function notifyActiveChannel(
   now: Date,
   send: () => Promise<void>,
 ): Promise<NotificationResult> {
-  let alertSent = false;
-
   try {
     await send();
-    alertSent = true;
+  } catch (error) {
+    console.error(
+      `${channelLabel(channel)} active-incident notification failed:`,
+      error,
+    );
+    return 'failed';
+  }
+
+  try {
     const records = incidents.map((incident) => {
       const existing = storedById.get(incident.id);
       return {
@@ -715,9 +784,7 @@ async function notifyActiveChannel(
     return 'sent';
   } catch (error) {
     console.error(
-      alertSent
-        ? `${channelLabel(channel)} active-incident alert was sent, but Redis tracking failed:`
-        : `${channelLabel(channel)} active-incident notification failed:`,
+      `${channelLabel(channel)} active-incident alert was sent, but Redis tracking failed:`,
       error,
     );
     return 'failed';
@@ -731,11 +798,17 @@ async function notifyResolvedChannel(
   incidentStore: IncidentStore,
   send: () => Promise<void>,
 ): Promise<NotificationResult> {
-  let alertSent = false;
-
   try {
     await send();
-    alertSent = true;
+  } catch (error) {
+    console.error(
+      `${channelLabel(channel)} resolved-incident notification failed:`,
+      error,
+    );
+    return 'failed';
+  }
+
+  try {
     const records = incidents.map((stored) => {
       const current = storedById.get(stored.incident.id) ?? stored;
       return {
@@ -753,9 +826,7 @@ async function notifyResolvedChannel(
     return 'sent';
   } catch (error) {
     console.error(
-      alertSent
-        ? `${channelLabel(channel)} resolution alert was sent, but Redis tracking failed:`
-        : `${channelLabel(channel)} resolved-incident notification failed:`,
+      `${channelLabel(channel)} resolution alert was sent, but Redis tracking failed:`,
       error,
     );
     return 'failed';
@@ -775,7 +846,7 @@ function normalizeNotificationConfiguration(
 
   return {
     discordWebhookUrl: configuration.discordWebhookUrl,
-    modmailEnabled: configuration.modmailEnabled === true,
+    modmailEnabled: configuration.modmailEnabled,
     minimumIncidentSeverity: normalizeMinimumIncidentSeverity(
       configuration.minimumIncidentSeverity,
     ),
@@ -860,15 +931,11 @@ function resolutionComplete(
     return false;
   }
 
-  if (
+  return !(
     configuration.modmailEnabled &&
     activeChannels.includes('modmail') &&
     !resolvedChannels.includes('modmail')
-  ) {
-    return false;
-  }
-
-  return true;
+  );
 }
 
 function aggregateNotificationResult(

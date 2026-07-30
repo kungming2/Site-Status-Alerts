@@ -1,67 +1,64 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createRedisIncidentStore } from './incident-store.ts';
+import {
+  createRedisIncidentStore,
+  type RedisIncidentClient,
+} from './incident-store.ts';
 import type { RedditIncident } from './status.ts';
 
-class MemoryRedisClient {
-  readonly hashes = new Map<string, Map<string, string>>();
-
-  async hGetAll(key: string): Promise<Record<string, string>> {
-    return Object.fromEntries(this.hashes.get(key) ?? []);
-  }
-
-  async hGet(key: string, field: string): Promise<string | undefined> {
-    return this.hashes.get(key)?.get(field);
-  }
-
-  async hSet(
-    key: string,
-    fieldValues: Record<string, string>,
-  ): Promise<number> {
-    const hash = this.getHash(key);
-    let added = 0;
-    for (const [field, value] of Object.entries(fieldValues)) {
-      if (!hash.has(field)) {
-        added += 1;
-      }
-      hash.set(field, value);
-    }
-    return added;
-  }
-
-  async hSetNX(
-    key: string,
-    field: string,
-    value: string,
-  ): Promise<number> {
-    const hash = this.getHash(key);
-    if (hash.has(field)) {
-      return 0;
-    }
-    hash.set(field, value);
-    return 1;
-  }
-
-  async hDel(key: string, fields: string[]): Promise<number> {
-    const hash = this.getHash(key);
-    let removed = 0;
-    for (const field of fields) {
-      if (hash.delete(field)) {
-        removed += 1;
-      }
-    }
-    return removed;
-  }
-
-  private getHash(key: string): Map<string, string> {
-    let hash = this.hashes.get(key);
+function createMemoryRedisClient(): RedisIncidentClient {
+  const hashes = new Map<string, Map<string, string>>();
+  const getHash = (key: string): Map<string, string> => {
+    let hash = hashes.get(key);
     if (!hash) {
       hash = new Map();
-      this.hashes.set(key, hash);
+      hashes.set(key, hash);
     }
     return hash;
-  }
+  };
+
+  return {
+    async hGetAll(key) {
+      return Object.fromEntries(hashes.get(key) ?? []);
+    },
+
+    async hGet(key, field) {
+      return hashes.get(key)?.get(field);
+    },
+
+    async hSet(key, fieldValues) {
+      const hash = getHash(key);
+      let added = 0;
+      for (const [field, value] of Object.entries(fieldValues)) {
+        if (!hash.has(field)) {
+          added += 1;
+        }
+        hash.set(field, value);
+      }
+      return added;
+    },
+
+    async hSetNX(key, field, value) {
+      const hash = getHash(key);
+      if (hash.has(field)) {
+        return 0;
+      }
+      hash.set(field, value);
+      return 1;
+    },
+
+    async hDel(key, fields) {
+      const hash = getHash(key);
+      let removed = 0;
+      for (const field of fields) {
+        if (hash.delete(field)) {
+          removed += 1;
+        }
+      }
+      return removed;
+    },
+  };
 }
 
 const incident: RedditIncident = {
@@ -73,7 +70,7 @@ const incident: RedditIncident = {
 };
 
 test('Redis incident store saves, reads, and removes active incidents', async () => {
-  const client = new MemoryRedisClient();
+  const client = createMemoryRedisClient();
   const store = createRedisIncidentStore(client);
   const stored = {
     incident,
@@ -88,6 +85,7 @@ test('Redis incident store saves, reads, and removes active incidents', async ()
 
   const storedWithChannels = {
     ...stored,
+    resolvedAt: '2026-07-29T21:45:00.000Z',
     activeNotificationChannels: ['discord', 'modmail'] as const,
     resolvedNotificationChannels: ['discord'] as const,
   };
@@ -104,7 +102,7 @@ test('Redis incident store saves, reads, and removes active incidents', async ()
 });
 
 test('Redis incident claims prevent overlap and allow stale claims to recover', async () => {
-  const client = new MemoryRedisClient();
+  const client = createMemoryRedisClient();
   const store = createRedisIncidentStore(client);
   const firstClaim = new Date('2026-07-29T20:00:00.000Z');
 
