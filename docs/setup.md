@@ -2,13 +2,18 @@
 
 [Back to the README](../README.md)
 
-Site Status Alerts checks Reddit's public incident feed every 30 minutes and
+Site Status Alerts checks Reddit's [public incident status page](https://www.redditstatus.com/) every 30 minutes and
 can notify a subreddit's moderators through Discord, Slack, Modmail, or any
 combination of those channels.
 
+Observations from a [previous outage](https://www.redditstatus.com/incidents/s4ffy6g43v5h)
+suggest that Devvit will remain operational during some Reddit outages, allowing
+the app to send status notifications even when Reddit's website or other services
+are unavailable. 
+
 ## Configure an installation
 
-After installing the app on your subreddit, open its subreddit settings.
+After installing the app on your subreddit, open its subreddit settings at `https://developers.reddit.com/r/SUBREDDIT/apps/site-status-alerts`:.
 
 1. Under **Incident filtering**, choose **Minimum incident severity**.
 2. Configure at least one notification channel using the settings below.
@@ -21,9 +26,11 @@ After installing the app on your subreddit, open its subreddit settings.
 | Major or higher (default) | Major and critical         |
 | Critical only             | Critical                   |
 
+Generally speaking, only major incidents result in widespread site issues.
+
 The app ignores impact values of `none` and `maintenance`. Unrecognized impact
-values remain eligible so an unexpected feed value does not silently suppress
-an incident.
+values remain eligible so if Reddit creates a new category, 
+an unexpected feed value does not silently suppress an incident.
 
 | Settings group        | Setting                      | Default                  |
 |-----------------------|------------------------------|--------------------------|
@@ -31,22 +38,25 @@ an incident.
 | Slack notifications   | Slack incoming webhook URL   | Empty; no Slack alerts   |
 | Modmail notifications | Enable Modmail notifications | Off                      |
 
+By default, the app can't really do anything without some configuration 
+as to where it should send the status alerts.
+
 Enter the webhook URL for the destination Discord or Slack channel. Webhook
 URLs can be left blank when those channels are unused. Modmail requires only
 the toggle. If both webhook fields are empty and Modmail is off, the app has
 no notification destination.
 
-## Check status manually
+## Check status manually (menu item)
 
 Choose **[SSA] Check Reddit site status** from the subreddit menu. This
 moderator-only action runs the same check as the scheduled task: it can send
 real incident and resolution alerts and update stored delivery records. The
-Reddit toast reports the result, including delivery failures where applicable.
+Reddit toast pop-up reports the result, including delivery failures where applicable.
 
 An all-clear result means the feed has no incidents meeting the configured
-minimum. It does not independently verify that every Reddit feature works.
+minimum. 
 
-## Send test alerts
+## Send test alerts (menu item)
 
 Choose **[SSA] Send test outage alerts** from the same menu. This sends clearly
 marked mock incidents to your configured destinations using the current
@@ -56,7 +66,7 @@ severity filter:
 - **Major or higher** includes the major and critical mock incidents.
 - **Critical only** includes the critical mock incident.
 
-The toast reports which channels succeeded, failed, or have invalid settings.
+The toast pop-up reports which channels succeeded, failed, or have invalid settings.
 Test alerts do not fetch the live incident feed, create incident records, or
 produce later resolution alerts. To retry a failed test, run the menu action
 again.
@@ -93,7 +103,6 @@ observes the incident missing from the feed.
 | No notifications arrive                         | Enable at least one channel, save settings, and send a test alert.                                              |
 | Minor incidents are missing                     | The default minimum is major; select minor to include them.                                                     |
 | Only some mock incidents appear                 | Test alerts use the same severity filter as real alerts.                                                        |
-| One destination fails                           | Check that channel's webhook or Modmail setting; the other channels track delivery independently.               |
 | An ongoing incident is not announced again      | A successful alert is remembered per channel; use test alerts to check delivery again.                          |
 | A new destination does not receive an old alert | Tracking is by channel type, not webhook URL; replacing a Discord or Slack URL does not reset delivery history. |
 | A resolution alert is missing                   | That channel must have received the active alert and still be enabled when resolution is processed.             |

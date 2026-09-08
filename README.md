@@ -68,10 +68,8 @@ The app has access to these three domains:
 
 ## Version History
 
-* **1.0.0**: Initial release. Reject malformed incident feeds, prevent overlapping status checks,
-  require Discord delivery confirmation, and fix the installation settings URL
-  formatting. Preserve delivery tracking after temporary storage failures, reset
-  resolution state for reappearing incidents, and bound concurrent delivery times.
+* **1.0.1**: Documentation improvements.
+* **1.0.0**: Initial release with bug/incident hardening.
 
 See the [full version history](docs/version_history.md) for previous and alpha/beta releases.
 
