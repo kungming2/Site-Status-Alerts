@@ -4,8 +4,11 @@
 
 ## 1.0.1
 
-- Documentation improvements only, including clearer setup guidance and streamlined
-release notes. No changes to app behavior.
+- Improve documentation with clearer setup guidance and streamlined release notes.
+- Update the Devvit CLI and SDK dependencies to 0.14.3; see the
+  [Devvit changelog](https://developers.reddit.com/docs/changelog/).
+- Align the local Node.js requirement and type definitions with Devvit's Node.js 24
+  runtime.
 
 ## 1.0.0
 

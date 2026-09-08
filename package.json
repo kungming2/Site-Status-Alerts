@@ -16,15 +16,15 @@
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
-    "@devvit/redis": "0.13.10",
-    "@devvit/web": "0.13.10",
-    "@types/node": "20.14.12",
-    "devvit": "0.13.10",
+    "@devvit/redis": "0.14.3",
+    "@devvit/web": "0.14.3",
+    "@types/node": "24.13.3",
+    "devvit": "0.14.3",
     "esbuild": "0.25.9",
     "typescript": "5.8.3"
   },
   "engines": {
-    "node": ">=22.6"
+    "node": ">=24"
   },
   "license": "MIT"
 }

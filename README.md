@@ -68,7 +68,7 @@ The app has access to these three domains:
 
 ## Version History
 
-* **1.0.1**: Documentation improvements.
+* **1.0.1**: Documentation improvements and an update to Devvit 0.14.3.
 * **1.0.0**: Initial release with bug/incident hardening.
 
 See the [full version history](docs/version_history.md) for previous and alpha/beta releases.
