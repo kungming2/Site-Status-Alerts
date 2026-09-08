@@ -14,6 +14,7 @@ const DISCORD_COLORS = {
 } as const;
 const SLACK_TEXT_LIMIT = 4_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const CHECK_DELIVERY_BUDGET_MS = 20_000;
 const INCIDENT_SEVERITY_RANK = {
   minor: 1,
   major: 2,
@@ -124,16 +125,17 @@ export type IncidentResolution = {
   resolvedAt?: string;
 };
 
-export type IncidentClaimKind = 'active' | 'resolved';
+export class StatusCheckInProgressError extends Error {
+  constructor() {
+    super('A Reddit status check is already running. Please try again shortly.');
+    this.name = 'StatusCheckInProgressError';
+  }
+}
 
 export type IncidentStore = {
   listActive(): Promise<StoredIncident[]>;
-  claim(
-    kind: IncidentClaimKind,
-    incidentId: string,
-    claimedAt: Date,
-  ): Promise<boolean>;
-  releaseClaims(kind: IncidentClaimKind, incidentIds: string[]): Promise<void>;
+  acquireCheckLock(): Promise<string | undefined>;
+  releaseCheckLock(token: string): Promise<void>;
   saveActive(incidents: StoredIncident[]): Promise<void>;
   removeActive(incidentIds: string[]): Promise<void>;
 };
@@ -158,6 +160,30 @@ type NotificationTestDependencies = {
 export async function checkRedditStatus(
   configuration: NotificationConfiguration | string | undefined,
   dependencies: StatusCheckDependencies,
+): Promise<StatusCheckResult> {
+  const deliveryDeadline = Date.now() + CHECK_DELIVERY_BUDGET_MS;
+  const token = await dependencies.incidentStore.acquireCheckLock();
+  if (token === undefined) {
+    throw new StatusCheckInProgressError();
+  }
+
+  try {
+    return await checkRedditStatusWithLock(
+      configuration, dependencies, deliveryDeadline,
+    );
+  } finally {
+    try {
+      await dependencies.incidentStore.releaseCheckLock(token);
+    } catch (error) {
+      console.error('Failed to release the Reddit status check lock:', error);
+    }
+  }
+}
+
+async function checkRedditStatusWithLock(
+  configuration: NotificationConfiguration | string | undefined,
+  dependencies: StatusCheckDependencies,
+  deliveryDeadline: number,
 ): Promise<StatusCheckResult> {
   const notificationConfiguration = normalizeNotificationConfiguration(
     configuration,
@@ -213,7 +239,15 @@ export async function checkRedditStatus(
 
   const refreshedStoredIncidents = storedIncidents.flatMap((stored) => {
     const current = incidentById.get(stored.incident.id);
-    return current ? [{ ...stored, incident: current }] : [];
+    if (!current) return [];
+    // The incident is active again, so earlier resolution acknowledgements and
+    // timestamps no longer describe its eventual resolution.
+    const {
+      resolvedAt: _resolvedAt,
+      resolvedNotificationChannels: _resolvedChannels,
+      ...active
+    } = stored;
+    return [{ ...active, incident: current }];
   });
   if (refreshedStoredIncidents.length > 0) {
     await incidentStore.saveActive(refreshedStoredIncidents);
@@ -296,95 +330,79 @@ export async function checkRedditStatus(
     channelNotifications.modmail.active = 'not-configured';
   }
 
-  const sendableActive = uniqueIncidents([
-    ...(discordValidationError ? [] : activePending.discord),
-    ...(slackValidationError ? [] : activePending.slack),
-    ...activePending.modmail,
-  ]);
-  const claimedActive = await claimIncidents(
-    incidentStore,
-    'active',
-    sendableActive,
-    now,
-  );
+  const notificationWriter = createNotificationWriter(incidentStore);
+  const notificationTasks: Array<() => Promise<void>> = [];
+  const deliver = (send: (signal: AbortSignal) => Promise<void>) =>
+    deliverWithinBudget(send, deliveryDeadline);
 
-  try {
-    const claimedActiveIds = new Set(
-      claimedActive.map((incident) => incident.id),
-    );
-    const discordActive = activePending.discord.filter((incident) =>
-      claimedActiveIds.has(incident.id),
-    );
-    const slackActive = activePending.slack.filter((incident) =>
-      claimedActiveIds.has(incident.id),
-    );
-    const modmailActive = activePending.modmail.filter((incident) =>
-      claimedActiveIds.has(incident.id),
-    );
+  const discordActive = activePending.discord;
+  const slackActive = activePending.slack;
+  const modmailActive = activePending.modmail;
 
-    if (
-      !discordValidationError &&
-      discordWebhookUrl &&
-      discordActive.length > 0
-    ) {
+  if (
+    !discordValidationError &&
+    discordWebhookUrl &&
+    discordActive.length > 0
+  ) {
+    notificationTasks.push(async () => {
       channelNotifications.discord.active = await notifyActiveChannel(
         'discord',
         discordActive,
         storedById,
-        incidentStore,
+        notificationWriter,
         now,
-        () =>
+        () => deliver((signal) =>
           sendDiscordAlert(
             discordWebhookUrl,
             formatDiscordAlert(discordActive),
             fetchImpl,
-          ),
+            signal,
+          )),
       );
-    }
+    });
+  }
 
-    if (
-      !slackValidationError &&
-      slackWebhookUrl &&
-      slackActive.length > 0
-    ) {
+  if (
+    !slackValidationError &&
+    slackWebhookUrl &&
+    slackActive.length > 0
+  ) {
+    notificationTasks.push(async () => {
       channelNotifications.slack.active = await notifyActiveChannel(
         'slack',
         slackActive,
         storedById,
-        incidentStore,
+        notificationWriter,
         now,
-        () =>
+        () => deliver((signal) =>
           sendSlackAlert(
             slackWebhookUrl,
             formatSlackAlert(slackActive),
             fetchImpl,
-          ),
+            signal,
+          )),
       );
-    }
+    });
+  }
 
-    if (modmailActive.length > 0) {
+  if (modmailActive.length > 0) {
+    notificationTasks.push(async () => {
       channelNotifications.modmail.active = await notifyActiveChannel(
         'modmail',
         modmailActive,
         storedById,
-        incidentStore,
+        notificationWriter,
         now,
-        async () => {
+        () => deliver(async () => {
           if (!dependencies.sendModmailNotification) {
             throw new Error('The Modmail notification sender is unavailable');
           }
           await dependencies.sendModmailNotification(
             formatModmailAlert(modmailActive),
           );
-        },
+        }),
       );
-    }
-  } finally {
-    await releaseClaimsSafely(
-      incidentStore,
-      'active',
-      claimedActive.map((incident) => incident.id),
-    );
+    });
   }
 
   const resolvedPending = {
@@ -443,38 +461,18 @@ export async function checkRedditStatus(
     );
   }
 
-  const claimedResolved = await claimIncidents(
-    incidentStore,
-    'resolved',
-    uniqueIncidents([
-      ...resolvedPending.discord.map((stored) => stored.incident),
-      ...resolvedPending.slack.map((stored) => stored.incident),
-      ...resolvedPending.modmail.map((stored) => stored.incident),
-    ]),
-    now,
-  );
+  const discordResolved = resolvedPending.discord;
+  const slackResolved = resolvedPending.slack;
+  const modmailResolved = resolvedPending.modmail;
 
-  try {
-    const claimedResolvedIds = new Set(
-      claimedResolved.map((incident) => incident.id),
-    );
-    const discordResolved = resolvedPending.discord.filter((stored) =>
-      claimedResolvedIds.has(stored.incident.id),
-    );
-    const slackResolved = resolvedPending.slack.filter((stored) =>
-      claimedResolvedIds.has(stored.incident.id),
-    );
-    const modmailResolved = resolvedPending.modmail.filter((stored) =>
-      claimedResolvedIds.has(stored.incident.id),
-    );
-
-    if (discordWebhookUrl && discordResolved.length > 0) {
+  if (discordWebhookUrl && discordResolved.length > 0) {
+    notificationTasks.push(async () => {
       channelNotifications.discord.resolved = await notifyResolvedChannel(
         'discord',
         discordResolved,
         storedById,
-        incidentStore,
-        () =>
+        notificationWriter,
+        () => deliver((signal) =>
           sendDiscordAlert(
             discordWebhookUrl,
             formatDiscordResolutionAlert(
@@ -484,17 +482,20 @@ export async function checkRedditStatus(
               })),
             ),
             fetchImpl,
-          ),
+            signal,
+          )),
       );
-    }
+    });
+  }
 
-    if (slackWebhookUrl && slackResolved.length > 0) {
+  if (slackWebhookUrl && slackResolved.length > 0) {
+    notificationTasks.push(async () => {
       channelNotifications.slack.resolved = await notifyResolvedChannel(
         'slack',
         slackResolved,
         storedById,
-        incidentStore,
-        () =>
+        notificationWriter,
+        () => deliver((signal) =>
           sendSlackAlert(
             slackWebhookUrl,
             formatSlackResolutionAlert(
@@ -504,17 +505,20 @@ export async function checkRedditStatus(
               })),
             ),
             fetchImpl,
-          ),
+            signal,
+          )),
       );
-    }
+    });
+  }
 
-    if (modmailResolved.length > 0) {
+  if (modmailResolved.length > 0) {
+    notificationTasks.push(async () => {
       channelNotifications.modmail.resolved = await notifyResolvedChannel(
         'modmail',
         modmailResolved,
         storedById,
-        incidentStore,
-        async () => {
+        notificationWriter,
+        () => deliver(async () => {
           if (!dependencies.sendModmailNotification) {
             throw new Error('The Modmail notification sender is unavailable');
           }
@@ -526,29 +530,26 @@ export async function checkRedditStatus(
               })),
             ),
           );
-        },
+        }),
       );
-    }
-
-    const completedResolvedIds = resolvedStored
-      .map((stored) => storedById.get(stored.incident.id) ?? stored)
-      .filter((stored) =>
-        resolutionComplete(
-          stored,
-          notificationConfiguration,
-          discordValidationError,
-          slackValidationError,
-        ),
-      )
-      .map((stored) => stored.incident.id);
-    await incidentStore.removeActive(completedResolvedIds);
-  } finally {
-    await releaseClaimsSafely(
-      incidentStore,
-      'resolved',
-      claimedResolved.map((incident) => incident.id),
-    );
+    });
   }
+
+  await Promise.all(notificationTasks.map((task) => task()));
+  await notificationWriter.flush();
+
+  const completedResolvedIds = resolvedStored
+    .map((stored) => storedById.get(stored.incident.id) ?? stored)
+    .filter((stored) =>
+      resolutionComplete(
+        stored,
+        notificationConfiguration,
+        discordValidationError,
+        slackValidationError,
+      ),
+    )
+    .map((stored) => stored.incident.id);
+  await incidentStore.removeActive(completedResolvedIds);
 
   const notifications = {
     active: aggregateNotificationResult(
@@ -655,24 +656,31 @@ export async function fetchRedditIncidents(
   }
 
   const rawIncidents = payload.incidents;
-  if (rawIncidents == null) {
-    return [];
-  }
   if (!Array.isArray(rawIncidents)) {
     throw new Error('Reddit Status API returned an invalid incidents list');
   }
 
-  return rawIncidents
-    .filter(isRecord)
-    .map(normalizeIncident);
+  // A partial list could falsely resolve a previously alerted incident. Reject
+  // the whole response instead of silently dropping or inventing identities.
+  const incidents: RedditIncident[] = [];
+  for (const raw of rawIncidents) {
+    if (!isRecord(raw) || typeof raw.id !== 'string' || !raw.id.trim()) {
+      throw new Error('Reddit Status API returned an invalid incident record');
+    }
+    incidents.push(normalizeIncident(raw));
+  }
+  return incidents;
 }
 
 export async function sendDiscordAlert(
   webhookUrl: string,
   payload: DiscordWebhookPayload,
   fetchImpl: Fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetchImpl(webhookUrl, {
+  const url = new URL(webhookUrl);
+  url.searchParams.set('wait', 'true');
+  const response = await fetchImpl(url.toString(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -680,7 +688,9 @@ export async function sendDiscordAlert(
       username: 'Reddit Site Status',
       allowed_mentions: { parse: [] },
     }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -692,12 +702,15 @@ export async function sendSlackAlert(
   webhookUrl: string,
   text: string,
   fetchImpl: Fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetchImpl(webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -1356,29 +1369,66 @@ function escapeSlackText(value: string): string {
     .replaceAll('>', '&gt;');
 }
 
-async function claimIncidents(
-  incidentStore: IncidentStore,
-  kind: IncidentClaimKind,
-  incidents: RedditIncident[],
-  claimedAt: Date,
-): Promise<RedditIncident[]> {
-  const claims = await Promise.all(
-    incidents.map(async (incident) => ({
-      incident,
-      claimed: await incidentStore.claim(kind, incident.id, claimedAt),
-    })),
-  );
+// Network sends may complete in any order. Persist complete channel snapshots
+// in that same order, and retry failed writes without repeating their sends.
+function createNotificationWriter(incidentStore: IncidentStore) {
+  const pending = new Map<string, StoredIncident>();
+  let writes = Promise.resolve();
+  return {
+    saveActive(records: StoredIncident[]): Promise<void> {
+      for (const record of records) pending.set(record.incident.id, record);
+      const write = writes.then(async () => {
+        await incidentStore.saveActive(records);
+        for (const record of records) {
+          if (pending.get(record.incident.id) === record) {
+            pending.delete(record.incident.id);
+          }
+        }
+      });
+      writes = write.catch(() => undefined);
+      return write;
+    },
+    async flush(): Promise<void> {
+      await writes;
+      if (pending.size > 0) {
+        await incidentStore.saveActive([...pending.values()]);
+        pending.clear();
+      }
+    },
+  };
+}
 
-  return claims
-    .filter(({ claimed }) => claimed)
-    .map(({ incident }) => incident);
+async function deliverWithinBudget(
+  send: (signal: AbortSignal) => Promise<void>,
+  deadline: number,
+): Promise<void> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new Error('Notification deferred: the status check delivery budget is exhausted');
+  }
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('Notification delivery timed out; retry on a later check');
+      controller.abort(error);
+      reject(error);
+    }, Math.min(REQUEST_TIMEOUT_MS, remaining));
+  });
+  try {
+    // HTTP honors cancellation. Modmail cannot be cancelled, so a timeout is
+    // an uncertain delivery and remains eligible for the normal retry path.
+    await Promise.race([send(controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function notifyActiveChannel(
   channel: NotificationChannel,
   incidents: RedditIncident[],
   storedById: Map<string, StoredIncident>,
-  incidentStore: IncidentStore,
+  incidentStore: Pick<IncidentStore, 'saveActive'>,
   now: Date,
   send: () => Promise<void>,
 ): Promise<NotificationResult> {
@@ -1406,17 +1456,17 @@ async function notifyActiveChannel(
           existing?.resolvedNotificationChannels,
       };
     });
-    await incidentStore.saveActive(records);
     for (const stored of records) {
       storedById.set(stored.incident.id, stored);
     }
+    await incidentStore.saveActive(records);
     return 'sent';
   } catch (error) {
     console.error(
       `${channelLabel(channel)} active-incident alert was sent, but Redis tracking failed:`,
       error,
     );
-    return 'failed';
+    return 'sent';
   }
 }
 
@@ -1424,7 +1474,7 @@ async function notifyResolvedChannel(
   channel: NotificationChannel,
   incidents: StoredIncident[],
   storedById: Map<string, StoredIncident>,
-  incidentStore: IncidentStore,
+  incidentStore: Pick<IncidentStore, 'saveActive'>,
   send: () => Promise<void>,
 ): Promise<NotificationResult> {
   try {
@@ -1448,17 +1498,17 @@ async function notifyResolvedChannel(
         ]),
       };
     });
-    await incidentStore.saveActive(records);
     for (const stored of records) {
       storedById.set(stored.incident.id, stored);
     }
+    await incidentStore.saveActive(records);
     return 'sent';
   } catch (error) {
     console.error(
       `${channelLabel(channel)} resolution alert was sent, but Redis tracking failed:`,
       error,
     );
-    return 'failed';
+    return 'sent';
   }
 }
 
@@ -1605,12 +1655,6 @@ function uniqueChannels(
   return [...new Set(channels)];
 }
 
-function uniqueIncidents(incidents: RedditIncident[]): RedditIncident[] {
-  return [
-    ...new Map(incidents.map((incident) => [incident.id, incident])).values(),
-  ];
-}
-
 function resolutionComplete(
   stored: StoredIncident,
   configuration: NotificationConfiguration,
@@ -1673,18 +1717,6 @@ function channelLabel(channel: NotificationChannel): string {
       return 'Slack';
     case 'modmail':
       return 'Modmail';
-  }
-}
-
-async function releaseClaimsSafely(
-  incidentStore: IncidentStore,
-  kind: IncidentClaimKind,
-  incidentIds: string[],
-): Promise<void> {
-  try {
-    await incidentStore.releaseClaims(kind, incidentIds);
-  } catch (error) {
-    console.error(`Failed to release ${kind} incident claims:`, error);
   }
 }
 

@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto';
+
 import { redis, type RedisClient } from '@devvit/redis';
 
 import type {
-  IncidentClaimKind,
   IncidentStore,
   NotificationChannel,
   RedditIncident,
@@ -9,13 +10,21 @@ import type {
 } from './status.ts';
 
 const ACTIVE_INCIDENTS_KEY = 'site-status-alerts:active-incidents:v1';
-const INCIDENT_CLAIMS_KEY = 'site-status-alerts:incident-claims:v1';
-const STALE_CLAIM_MS = 5 * 60 * 1_000;
+const CHECK_LOCK_KEY = 'site-status-alerts:check-lock:v1';
+// Longer than Devvit's request lifetime; expiry recovers interrupted checks.
+const CHECK_LOCK_MS = 5 * 60 * 1_000;
 
 export type RedisIncidentClient = Pick<
   RedisClient,
-  'hDel' | 'hGet' | 'hGetAll' | 'hSet' | 'hSetNX'
->;
+  'hDel' | 'hGetAll' | 'hSet' | 'get' | 'set'
+> & {
+  watch(...keys: string[]): Promise<{
+    multi(): Promise<void>;
+    del(...keys: string[]): Promise<unknown>;
+    exec(): Promise<unknown>;
+    unwatch(): Promise<unknown>;
+  }>;
+};
 
 export const redisIncidentStore = createRedisIncidentStore(redis);
 
@@ -37,52 +46,33 @@ export function createRedisIncidentStore(
       });
     },
 
-    async claim(
-      kind: IncidentClaimKind,
-      incidentId: string,
-      claimedAt: Date,
-    ): Promise<boolean> {
-      const field = claimField(kind, incidentId);
-      const claimedAtValue = claimedAt.toISOString();
-      const claimed = await client.hSetNX(
-        INCIDENT_CLAIMS_KEY,
-        field,
-        claimedAtValue,
-      );
-      if (claimed === 1) {
-        return true;
-      }
-
-      const existing = await client.hGet(INCIDENT_CLAIMS_KEY, field);
-      const existingTime = existing ? Date.parse(existing) : Number.NaN;
-      if (
-        Number.isFinite(existingTime) &&
-        claimedAt.getTime() - existingTime < STALE_CLAIM_MS
-      ) {
-        return false;
-      }
-
-      await client.hDel(INCIDENT_CLAIMS_KEY, [field]);
-      return (
-        (await client.hSetNX(
-          INCIDENT_CLAIMS_KEY,
-          field,
-          claimedAtValue,
-        )) === 1
-      );
+    async acquireCheckLock(): Promise<string | undefined> {
+      const token = randomUUID();
+      const result = await client.set(CHECK_LOCK_KEY, token, {
+        nx: true,
+        expiration: new Date(Date.now() + CHECK_LOCK_MS),
+      });
+      return result === 'OK' ? token : undefined;
     },
 
-    async releaseClaims(
-      kind: IncidentClaimKind,
-      incidentIds: string[],
-    ): Promise<void> {
-      if (incidentIds.length === 0) {
-        return;
+    async releaseCheckLock(token: string): Promise<void> {
+      // WATCH makes the ownership check and deletion conditional on the same
+      // lock value. An expired owner must never delete a successor's lock.
+      const transaction = await client.watch(CHECK_LOCK_KEY);
+      let executed = false;
+      try {
+        if ((await client.get(CHECK_LOCK_KEY)) !== token) {
+          return;
+        }
+        await transaction.multi();
+        await transaction.del(CHECK_LOCK_KEY);
+        await transaction.exec();
+        executed = true;
+      } finally {
+        if (!executed) {
+          await transaction.unwatch();
+        }
       }
-      await client.hDel(
-        INCIDENT_CLAIMS_KEY,
-        incidentIds.map((incidentId) => claimField(kind, incidentId)),
-      );
     },
 
     async saveActive(incidents: StoredIncident[]): Promise<void> {
@@ -108,13 +98,6 @@ export function createRedisIncidentStore(
       await client.hDel(ACTIVE_INCIDENTS_KEY, incidentIds);
     },
   };
-}
-
-function claimField(
-  kind: IncidentClaimKind,
-  incidentId: string,
-): string {
-  return `${kind}:${incidentId}`;
 }
 
 function parseStoredIncident(value: string): StoredIncident | undefined {

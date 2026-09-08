@@ -2,6 +2,26 @@
 
 [Back to the README](../README.md)
 
+## 1.0.0
+
+Initial stable release.
+
+- Reject malformed incident feeds without sending false resolution alerts or
+  deleting stored incident records.
+- Prevent overlapping manual and scheduled checks from duplicating alerts or
+  overwriting delivery records with an installation-wide lock, automatic expiry,
+  and ownership-checked release.
+- Request Discord delivery confirmation before recording successful alerts.
+- Preserve successful channel deliveries through temporary Redis write failures
+  and retry tracking writes without repeating the notifications.
+- Clear stale resolution timestamps and delivery markers when an incident
+  reappears, so its eventual resolution reaches every eligible channel.
+- Send channel notifications concurrently with serialized tracking writes and a
+  shared delivery time budget; retry failed or deferred alerts on later checks.
+- Fix the README's installation settings URL formatting.
+- Refresh the README and setup guidance, including notification timeouts and retry
+  behavior, and consolidate terms and privacy information in one document.
+
 ## 0.9.0
 
 - Add setup and troubleshooting documentation for moderator configuration,

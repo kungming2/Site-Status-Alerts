@@ -17,6 +17,7 @@ import {
   checkRedditStatus,
   normalizeMinimumIncidentSeverity,
   sendTestOutageAlerts,
+  StatusCheckInProgressError,
   validateDiscordWebhookUrl,
   validateMinimumIncidentSeverity,
   validateSlackWebhookUrl,
@@ -98,6 +99,9 @@ async function handleManualCheck(): Promise<UiResponse> {
       },
     };
   } catch (error) {
+    if (error instanceof StatusCheckInProgressError) {
+      return { showToast: { text: error.message, appearance: 'neutral' } };
+    }
     console.error('Manual Reddit status check failed:', error);
     return {
       showToast: {
@@ -139,9 +143,11 @@ async function handleScheduledCheck(): Promise<TaskResponse> {
     const result = await runConfiguredCheck();
     console.log(scheduledCheckMessage(result));
   } catch (error) {
-    // Match the original report's fail-soft behavior so a temporary API or
-    // webhook failure does not disable future hourly checks.
-    console.error('Scheduled Reddit status check failed:', error);
+    if (error instanceof StatusCheckInProgressError) {
+      console.log('Scheduled Reddit status check skipped: another check is running.');
+    } else {
+      console.error('Scheduled Reddit status check failed:', error);
+    }
   }
 
   return { status: 'ok' };

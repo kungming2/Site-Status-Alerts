@@ -70,7 +70,16 @@ the incident remains reportable.
 
 When a previously alerted incident disappears from the unresolved feed, the
 app sends a resolution alert to each still-enabled channel that received its
-active alert. Resolution delivery failures are retried on later checks.
+active alert. Resolution delivery failures are retried on later checks. If an incident
+reappears, its previous resolution state is cleared so the next resolution uses
+the new observation time and can notify all eligible channels again.
+
+Channels send concurrently. Each delivery attempt has up to 10 seconds within a
+shared 20-second delivery budget for the check, leaving time for storage and
+cleanup. Failed or deferred alerts remain eligible for a later check. A request
+that times out can still reach its destination, particularly Modmail, whose API
+does not support cancellation; retries can therefore occasionally duplicate an
+alert.
 
 Discord uses rich embeds. Discord and Slack display timestamps in the viewer's
 locale and time zone; Modmail displays UTC with a local-time conversion link.

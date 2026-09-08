@@ -9,6 +9,20 @@ import type { RedditIncident } from './status.ts';
 
 function createMemoryRedisClient(): RedisIncidentClient {
   const hashes = new Map<string, Map<string, string>>();
+  const strings = new Map<string, { value: string; expiration?: Date }>();
+  const revisions = new Map<string, number>();
+  const touch = (key: string): void => {
+    revisions.set(key, (revisions.get(key) ?? 0) + 1);
+  };
+  const getString = (key: string): string | undefined => {
+    const entry = strings.get(key);
+    if (entry?.expiration && entry.expiration.getTime() <= Date.now()) {
+      strings.delete(key);
+      touch(key);
+      return undefined;
+    }
+    return entry?.value;
+  };
   const getHash = (key: string): Map<string, string> => {
     let hash = hashes.get(key);
     if (!hash) {
@@ -23,8 +37,47 @@ function createMemoryRedisClient(): RedisIncidentClient {
       return Object.fromEntries(hashes.get(key) ?? []);
     },
 
-    async hGet(key, field) {
-      return hashes.get(key)?.get(field);
+    async get(key) {
+      return getString(key);
+    },
+
+    async set(key, value, options) {
+      if (options?.nx && getString(key) !== undefined) return '';
+      strings.set(key, { value, expiration: options?.expiration });
+      touch(key);
+      return 'OK';
+    },
+
+    async watch(...keys) {
+      for (const key of keys) getString(key);
+      const watched = keys.map((key) => revisions.get(key) ?? 0);
+      const deleted: string[] = [];
+      let finished = false;
+      const transaction = {
+        async multi() {},
+        async del(...keysToDelete: string[]) {
+          deleted.push(...keysToDelete);
+          return transaction;
+        },
+        async exec() {
+          finished = true;
+          for (const key of keys) getString(key);
+          if (keys.some((key, i) => (revisions.get(key) ?? 0) !== watched[i])) {
+            return [];
+          }
+          for (const key of deleted) {
+            strings.delete(key);
+            touch(key);
+          }
+          return [deleted.length];
+        },
+        async unwatch() {
+          assert.equal(finished, false, 'Do not reuse an executed transaction');
+          finished = true;
+          return transaction;
+        },
+      };
+      return transaction;
     },
 
     async hSet(key, fieldValues) {
@@ -37,15 +90,6 @@ function createMemoryRedisClient(): RedisIncidentClient {
         hash.set(field, value);
       }
       return added;
-    },
-
-    async hSetNX(key, field, value) {
-      const hash = getHash(key);
-      if (hash.has(field)) {
-        return 0;
-      }
-      hash.set(field, value);
-      return 1;
     },
 
     async hDel(key, fields) {
@@ -101,36 +145,59 @@ test('Redis incident store saves, reads, and removes active incidents', async ()
   assert.deepEqual(await store.listActive(), [storedWithChannels]);
 });
 
-test('Redis incident claims prevent overlap and allow stale claims to recover', async () => {
+test('Redis check locks allow one owner and expire for interrupted checks', async (t) => {
+  let now = Date.parse('2026-09-08T10:00:00Z');
+  t.mock.method(Date, 'now', () => now);
   const client = createMemoryRedisClient();
-  const store = createRedisIncidentStore(client);
-  const firstClaim = new Date('2026-07-29T20:00:00.000Z');
+  // Separate store instances model separate request handlers.
+  const firstStore = createRedisIncidentStore(client);
+  const secondStore = createRedisIncidentStore(client);
+  const first = await firstStore.acquireCheckLock();
+  assert.ok(first);
+  assert.equal(await secondStore.acquireCheckLock(), undefined);
 
-  assert.equal(await store.claim('active', incident.id, firstClaim), true);
-  assert.equal(
-    await store.claim(
-      'active',
-      incident.id,
-      new Date('2026-07-29T20:01:00.000Z'),
-    ),
-    false,
-  );
-  assert.equal(
-    await store.claim(
-      'active',
-      incident.id,
-      new Date('2026-07-29T20:06:00.000Z'),
-    ),
-    true,
-  );
+  now += 6 * 60 * 1_000;
+  const claims = await Promise.all([
+    firstStore.acquireCheckLock(), secondStore.acquireCheckLock(),
+  ]);
+  const recovered = claims.filter((token) => token !== undefined);
+  assert.equal(recovered.length, 1);
+  assert.notEqual(recovered[0], first);
 
-  await store.releaseClaims('active', [incident.id]);
-  assert.equal(
-    await store.claim(
-      'active',
-      incident.id,
-      new Date('2026-07-29T20:07:00.000Z'),
-    ),
-    true,
-  );
+  // A late release from the expired run cannot unlock the successor.
+  await firstStore.releaseCheckLock(first);
+  assert.equal(await secondStore.acquireCheckLock(), undefined);
+  await secondStore.releaseCheckLock(recovered[0]!);
+  assert.ok(await firstStore.acquireCheckLock());
+});
+
+test('Redis lock release cannot delete a replacement acquired during release', async (t) => {
+  let now = Date.parse('2026-09-08T10:00:00Z');
+  t.mock.method(Date, 'now', () => now);
+  const client = createMemoryRedisClient();
+  const successor = createRedisIncidentStore(client);
+  let replacement: string | undefined;
+  const racingClient: RedisIncidentClient = {
+    ...client,
+    async watch(...keys) {
+      const transaction = await client.watch(...keys);
+      return {
+        ...transaction,
+        async exec() {
+          // Expire and replace after ownership was checked but before DEL.
+          now += 6 * 60 * 1_000;
+          replacement = await successor.acquireCheckLock();
+          return transaction.exec();
+        },
+      };
+    },
+  };
+  const original = createRedisIncidentStore(racingClient);
+  const token = await original.acquireCheckLock();
+  assert.ok(token);
+  await original.releaseCheckLock(token);
+  assert.ok(replacement);
+  assert.equal(await successor.acquireCheckLock(), undefined);
+  await successor.releaseCheckLock(replacement);
+  assert.ok(await successor.acquireCheckLock());
 });

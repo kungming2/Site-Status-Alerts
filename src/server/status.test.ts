@@ -15,12 +15,13 @@ import {
   formatSlackTestAlert,
   normalizeMinimumIncidentSeverity,
   sendSlackAlert,
+  sendDiscordAlert,
+  StatusCheckInProgressError,
   sendTestOutageAlerts,
   validateDiscordWebhookUrl,
   validateMinimumIncidentSeverity,
   validateSlackWebhookUrl,
   type DiscordWebhookPayload,
-  type IncidentClaimKind,
   type IncidentStore,
   type ModmailNotification,
   type RedditIncident,
@@ -42,32 +43,21 @@ const majorIncident: RedditIncident = {
 
 class MemoryIncidentStore implements IncidentStore {
   readonly active = new Map<string, StoredIncident>();
-  readonly claims = new Set<string>();
+  lockToken: string | undefined;
+  private nextToken = 0;
 
   async listActive(): Promise<StoredIncident[]> {
     return [...this.active.values()];
   }
 
-  async claim(
-    kind: IncidentClaimKind,
-    incidentId: string,
-    _claimedAt: Date,
-  ): Promise<boolean> {
-    const claim = `${kind}:${incidentId}`;
-    if (this.claims.has(claim)) {
-      return false;
-    }
-    this.claims.add(claim);
-    return true;
+  async acquireCheckLock(): Promise<string | undefined> {
+    if (this.lockToken !== undefined) return undefined;
+    this.lockToken = String(++this.nextToken);
+    return this.lockToken;
   }
 
-  async releaseClaims(
-    kind: IncidentClaimKind,
-    incidentIds: string[],
-  ): Promise<void> {
-    for (const incidentId of incidentIds) {
-      this.claims.delete(`${kind}:${incidentId}`);
-    }
+  async releaseCheckLock(token: string): Promise<void> {
+    if (this.lockToken === token) this.lockToken = undefined;
   }
 
   async saveActive(incidents: StoredIncident[]): Promise<void> {
@@ -187,7 +177,7 @@ test('checkRedditStatus defaults to major and ignores lower impacts', async (t) 
   assert.equal(result.notifications.resolved, 'not-needed');
   assert.equal(incidentStore.active.size, 1);
   assert.equal(requests.length, 2);
-  assert.equal(requests[1].url, 'https://discord.com/api/webhooks/123/token');
+  assert.equal(requests[1].url, 'https://discord.com/api/webhooks/123/token?wait=true');
   assert.deepEqual(
     JSON.parse(String(requests[1].init?.body)),
     {
@@ -489,7 +479,7 @@ test('checkRedditStatus retains resolved incidents when the resolution alert fai
   );
 });
 
-test('concurrent checks claim a new incident only once', async (t) => {
+test('concurrent checks skip the overlap and send a new incident only once', async (t) => {
   t.mock.method(console, 'log', () => undefined);
   const incidentStore = new MemoryIncidentStore();
   let discordRequests = 0;
@@ -514,7 +504,7 @@ test('concurrent checks claim a new incident only once', async (t) => {
     return new Response(null, { status: 204 });
   };
 
-  await Promise.all([
+  const results = await Promise.allSettled([
     checkRedditStatus('https://discord.com/api/webhooks/123/token', {
       incidentStore,
       fetchImpl: fakeFetch,
@@ -525,6 +515,11 @@ test('concurrent checks claim a new incident only once', async (t) => {
     }),
   ]);
 
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  const skipped = results.find((result) => result.status === 'rejected');
+  assert.ok(skipped?.status === 'rejected');
+  assert.ok(skipped.reason instanceof StatusCheckInProgressError);
+  assert.equal(incidentStore.lockToken, undefined);
   assert.equal(discordRequests, 1);
   assert.equal(incidentStore.active.size, 1);
 });
@@ -856,7 +851,7 @@ test('test outage alerts respect severity and make the test section bold', async
   });
   assert.equal(webhookMessages.size, 2);
   const discordPayload = webhookMessages.get(
-    'https://discord.com/api/webhooks/123/token',
+    'https://discord.com/api/webhooks/123/token?wait=true',
   ) as DiscordWebhookPayload | undefined;
   const discordEmbed = discordPayload?.embeds[0];
   assert.equal(discordEmbed?.title, '🧪 Test: Active Reddit Incidents');
@@ -1007,4 +1002,385 @@ test('validateMinimumIncidentSeverity requires a recognized selection', () => {
   );
   assert.equal(validateMinimumIncidentSeverity(['major']), undefined);
   assert.equal(validateMinimumIncidentSeverity([' CRITICAL ']), undefined);
+});
+
+
+test('malformed feeds preserve incident records and release the check lock', async () => {
+  for (const payload of [{}, { incidents: null }, { incidents: {} },
+    { incidents: [null] }, { incidents: [{}] }, { incidents: [{ id: '' }] },
+    { incidents: [majorIncident, 42] }]) {
+    const incidentStore = new MemoryIncidentStore();
+    const stored: StoredIncident = {
+      incident: majorIncident,
+      alertedAt: '2026-07-29T20:00:00.000Z',
+      activeNotificationChannels: ['discord'],
+    };
+    await incidentStore.saveActive([stored]);
+    let webhookCalls = 0;
+    await assert.rejects(checkRedditStatus(
+      'https://discord.com/api/webhooks/123/token',
+      {
+        incidentStore,
+        fetchImpl: async (input) => {
+          if (!String(input).includes('redditstatus.com')) webhookCalls++;
+          return new Response(JSON.stringify(payload));
+        },
+      },
+    ), /Reddit Status API returned an invalid/);
+    assert.equal(webhookCalls, 0);
+    assert.deepEqual(await incidentStore.listActive(), [stored]);
+    assert.equal(incidentStore.lockToken, undefined);
+  }
+});
+
+test('a delayed second check reads delivery state after acquiring the lock', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  let finishFirst!: () => void;
+  const firstFinished = new Promise<void>((resolve) => { finishFirst = resolve; });
+  class DelayedStore extends MemoryIncidentStore {
+    attempts = 0;
+    override async acquireCheckLock(): Promise<string | undefined> {
+      if (++this.attempts === 2) await firstFinished;
+      return super.acquireCheckLock();
+    }
+  }
+  const incidentStore = new DelayedStore();
+  const messages: DiscordWebhookPayload[] = [];
+  const dependencies = {
+    incidentStore,
+    fetchImpl: createStatusAndDiscordFetch(() => [majorIncident], messages),
+  };
+  const url = 'https://discord.com/api/webhooks/123/token';
+  const first = checkRedditStatus(url, dependencies).finally(finishFirst);
+  const second = checkRedditStatus(url, dependencies);
+  await Promise.all([first, second]);
+  assert.equal(messages.length, 1);
+  assert.equal(incidentStore.active.size, 1);
+});
+
+test('the check lock covers resolution delivery and record deletion', async () => {
+  const incidentStore = new MemoryIncidentStore();
+  await incidentStore.saveActive([{
+    incident: majorIncident,
+    alertedAt: '2026-07-29T20:00:00.000Z',
+    activeNotificationChannels: ['discord'],
+  }]);
+  let started!: () => void;
+  let finish!: () => void;
+  const sending = new Promise<void>((resolve) => { started = resolve; });
+  const finishSending = new Promise<void>((resolve) => { finish = resolve; });
+  let feeds = 0;
+  let messages = 0;
+  const dependencies: StatusCheckDependencies = {
+    incidentStore,
+    fetchImpl: async (input) => {
+      if (String(input).includes('redditstatus.com')) {
+        feeds++;
+        return new Response(JSON.stringify({ incidents: [] }));
+      }
+      messages++;
+      started();
+      await finishSending;
+      return new Response(null, { status: 204 });
+    },
+  };
+  const url = 'https://discord.com/api/webhooks/123/token';
+  const first = checkRedditStatus(url, dependencies);
+  await sending;
+  await assert.rejects(checkRedditStatus(url, dependencies), StatusCheckInProgressError);
+  assert.equal(feeds, 1);
+  finish();
+  await first;
+  await checkRedditStatus(url, dependencies);
+  assert.equal(messages, 1);
+  assert.equal(incidentStore.active.size, 0);
+});
+
+test('a failed feed request releases the lock so a later check can run', async () => {
+  const incidentStore = new MemoryIncidentStore();
+  await assert.rejects(checkRedditStatus(undefined, {
+    incidentStore,
+    fetchImpl: async () => { throw new Error('Network unavailable'); },
+  }), /Network unavailable/);
+  await checkRedditStatus(undefined, {
+    incidentStore,
+    fetchImpl: async () => new Response(JSON.stringify({ incidents: [] })),
+  });
+  assert.equal(incidentStore.lockToken, undefined);
+});
+
+test('Discord requests delivery confirmation and preserves other query parameters', async () => {
+  const payload = formatDiscordAlert([majorIncident]);
+  for (const query of ['', '?wait=false&thread_id=456']) {
+    await sendDiscordAlert(`https://discord.com/api/webhooks/123/token${query}`, payload,
+      async (input, init) => {
+        const url = new URL(String(input));
+        assert.equal(url.searchParams.get('wait'), 'true');
+        assert.equal(url.searchParams.getAll('wait').length, 1);
+        assert.equal(url.searchParams.get('thread_id'), query ? '456' : null);
+        assert.equal(init?.method, 'POST');
+        assert.deepEqual(JSON.parse(String(init?.body)).embeds, payload.embeds);
+        return new Response(JSON.stringify({ id: 'message-1' }), { status: 200 });
+      });
+  }
+  await assert.rejects(sendDiscordAlert('https://discord.com/api/webhooks/123/token',
+    payload, async () => new Response('Cannot send message', { status: 400 })),
+    /Discord webhook returned HTTP 400/);
+});
+
+
+test('failed delivery-record writes are retried without forgetting successful channels', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  t.mock.method(console, 'error', () => undefined);
+  for (const withSlack of [false, true]) {
+    class FlakyStore extends MemoryIncidentStore {
+      failNext = true;
+      override async saveActive(records: StoredIncident[]): Promise<void> {
+        if (this.failNext) {
+          this.failNext = false;
+          throw new Error('Temporary Redis failure');
+        }
+        await super.saveActive(records);
+      }
+    }
+    const incidentStore = new FlakyStore();
+    let incidents: Record<string, unknown>[] = [majorIncident];
+    const messages: string[] = [];
+    const configuration = {
+      discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+      slackWebhookUrl: withSlack ? 'https://hooks.slack.com/services/T/B/token' : undefined,
+      modmailEnabled: false,
+    };
+    const dependencies = {
+      incidentStore,
+      fetchImpl: (async (input) => {
+        const host = new URL(String(input)).hostname;
+        if (host === 'www.redditstatus.com') {
+          return new Response(JSON.stringify({ incidents }));
+        }
+        messages.push(host);
+        return new Response(null, { status: 204 });
+      }) as typeof fetch,
+    };
+    await checkRedditStatus(configuration, dependencies);
+    assert.deepEqual(incidentStore.active.get(majorIncident.id)?.activeNotificationChannels,
+      withSlack ? ['discord', 'slack'] : ['discord']);
+    await checkRedditStatus(configuration, dependencies);
+    assert.equal(messages.length, withSlack ? 2 : 1);
+    incidents = [];
+    await checkRedditStatus(configuration, dependencies);
+    assert.equal(messages.filter((host) => host === 'discord.com').length, 2);
+    assert.equal(incidentStore.active.size, 0);
+  }
+});
+
+test('resolution write failures retain acknowledgements while another channel retries', async (t) => {
+  t.mock.method(console, 'error', () => undefined);
+  class FlakyStore extends MemoryIncidentStore {
+    writes = 0;
+    override async saveActive(records: StoredIncident[]): Promise<void> {
+      if (++this.writes === 2) throw new Error('Temporary Redis failure');
+      await super.saveActive(records);
+    }
+  }
+  const incidentStore = new FlakyStore();
+  incidentStore.active.set(majorIncident.id, {
+    incident: majorIncident, alertedAt: majorIncident.createdAt!,
+    activeNotificationChannels: ['discord', 'slack'],
+  });
+  let failSlack = true;
+  let discordSends = 0;
+  const configuration = {
+    discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+    slackWebhookUrl: 'https://hooks.slack.com/services/T/B/token', modmailEnabled: false,
+  };
+  const dependencies: StatusCheckDependencies = {
+    incidentStore,
+    fetchImpl: async (input) => {
+      const host = new URL(String(input)).hostname;
+      if (host === 'www.redditstatus.com') return new Response('{"incidents":[]}');
+      if (host === 'discord.com') discordSends++;
+      return new Response(null, { status: host === 'hooks.slack.com' && failSlack ? 500 : 204 });
+    },
+  };
+  await checkRedditStatus(configuration, dependencies);
+  assert.deepEqual(incidentStore.active.get(majorIncident.id)?.resolvedNotificationChannels, ['discord']);
+  failSlack = false;
+  await checkRedditStatus(configuration, dependencies);
+  assert.equal(discordSends, 1);
+  assert.equal(incidentStore.active.size, 0);
+});
+
+test('a reappearing incident clears prior resolution state even below the severity threshold', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  const incidentStore = new MemoryIncidentStore();
+  incidentStore.active.set(majorIncident.id, {
+    incident: majorIncident, alertedAt: majorIncident.createdAt!,
+    activeNotificationChannels: ['discord', 'slack'],
+    resolvedAt: '2026-07-29T20:30:00.000Z', resolvedNotificationChannels: ['discord'],
+  });
+  let incidents: Record<string, unknown>[] = [{
+    ...majorIncident, impact: 'minor', created_at: majorIncident.createdAt,
+  }];
+  const messages: Record<string, unknown>[] = [];
+  const configuration = {
+    discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+    slackWebhookUrl: 'https://hooks.slack.com/services/T/B/token', modmailEnabled: false,
+  };
+  const dependencies: StatusCheckDependencies = {
+    incidentStore, now: () => new Date('2026-07-29T22:00:00.000Z'),
+    fetchImpl: async (input, init) => {
+      if (String(input).includes('redditstatus.com')) return new Response(JSON.stringify({ incidents }));
+      messages.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: 204 });
+    },
+  };
+  await checkRedditStatus(configuration, dependencies);
+  const stored = incidentStore.active.get(majorIncident.id)!;
+  assert.equal(stored.resolvedAt, undefined);
+  assert.equal(stored.resolvedNotificationChannels, undefined);
+  assert.deepEqual(stored.activeNotificationChannels, ['discord', 'slack']);
+  assert.equal(messages.length, 0);
+  incidents = [];
+  await checkRedditStatus(configuration, dependencies);
+  assert.equal(messages.length, 2);
+  assert.match(JSON.stringify(messages), /2 hours/);
+  assert.equal(incidentStore.active.size, 0);
+});
+
+test('all channel and lifecycle sends run concurrently and persist merged delivery records', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  const incidentStore = new MemoryIncidentStore();
+  incidentStore.active.set('old', {
+    incident: { ...majorIncident, id: 'old' }, alertedAt: majorIncident.createdAt!,
+    activeNotificationChannels: ['discord', 'slack', 'modmail'],
+  });
+  let sends = 0;
+  let release!: () => void;
+  const allStarted = new Promise<void>((resolve) => { release = resolve; });
+  const send = async () => {
+    if (++sends === 6) release();
+    await allStarted;
+  };
+  const result = await checkRedditStatus({
+    discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+    slackWebhookUrl: 'https://hooks.slack.com/services/T/B/token', modmailEnabled: true,
+  }, {
+    incidentStore,
+    fetchImpl: async (input) => {
+      if (String(input).includes('redditstatus.com')) return new Response(JSON.stringify({ incidents: [majorIncident] }));
+      await send();
+      return new Response(null, { status: 204 });
+    },
+    sendModmailNotification: send,
+  });
+  assert.equal(sends, 6);
+  assert.equal(result.notifications.active, 'sent');
+  assert.equal(result.notifications.resolved, 'sent');
+  assert.deepEqual(new Set(incidentStore.active.get(majorIncident.id)?.activeNotificationChannels),
+    new Set(['discord', 'slack', 'modmail']));
+  assert.equal(incidentStore.active.has('old'), false);
+});
+
+test('delivery timeouts abort HTTP, bound Modmail waits, and leave retries pending', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  t.mock.method(console, 'error', () => undefined);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let elapsed = 0;
+  t.mock.method(Date, 'now', () => elapsed);
+  const incidentStore = new MemoryIncidentStore();
+  let started!: () => void;
+  const sending = new Promise<void>((resolve) => { started = resolve; });
+  let stalled = 0;
+  let signal: AbortSignal | undefined;
+  const stall = () => {
+    if (++stalled === 2) started();
+    return new Promise<void>(() => {});
+  };
+  const check = checkRedditStatus({
+    discordWebhookUrl: 'https://discord.com/api/webhooks/123/token',
+    slackWebhookUrl: 'https://hooks.slack.com/services/T/B/token', modmailEnabled: true,
+  }, {
+    incidentStore,
+    fetchImpl: async (input, init) => {
+      const host = new URL(String(input)).hostname;
+      if (host === 'www.redditstatus.com') {
+        elapsed = 15_000; // Feed and storage work consumed most of the budget.
+        return new Response(JSON.stringify({ incidents: [majorIncident] }));
+      }
+      if (host === 'discord.com') {
+        signal = init?.signal ?? undefined;
+        await stall();
+      }
+      return new Response(null, { status: 204 });
+    },
+    sendModmailNotification: stall,
+  });
+  await sending;
+  t.mock.timers.tick(5_001);
+  const result = await check;
+  assert.equal(signal?.aborted, true);
+  assert.equal(result.channelNotifications.discord.active, 'failed');
+  assert.equal(result.channelNotifications.modmail.active, 'failed');
+  assert.equal(result.channelNotifications.slack.active, 'sent');
+  assert.deepEqual(incidentStore.active.get(majorIncident.id)?.activeNotificationChannels, ['slack']);
+  assert.equal(incidentStore.lockToken, undefined);
+});
+
+test('an exhausted shared budget defers sends until the next check', async (t) => {
+  t.mock.method(console, 'log', () => undefined);
+  t.mock.method(console, 'error', () => undefined);
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const incidentStore = new MemoryIncidentStore();
+  let sends = 0;
+  const configuration = { discordWebhookUrl: 'https://discord.com/api/webhooks/123/token', modmailEnabled: false };
+  const dependencies: StatusCheckDependencies = {
+    incidentStore,
+    fetchImpl: async (input) => {
+      if (String(input).includes('redditstatus.com')) {
+        now += 20_001;
+        return new Response(JSON.stringify({ incidents: [majorIncident] }));
+      }
+      sends++;
+      return new Response(null, { status: 204 });
+    },
+  };
+  const result = await checkRedditStatus(configuration, dependencies);
+  assert.equal(result.channelNotifications.discord.active, 'failed');
+  assert.equal(sends, 0);
+  assert.equal(incidentStore.active.size, 0);
+  await checkRedditStatus(configuration, {
+    ...dependencies,
+    fetchImpl: async (input) => {
+      if (String(input).includes('redditstatus.com')) return new Response(JSON.stringify({ incidents: [majorIncident] }));
+      sends++;
+      return new Response(null, { status: 204 });
+    },
+  });
+  assert.equal(sends, 1);
+});
+
+
+test('persistent tracking failures fail the check without deleting a resolved record', async (t) => {
+  t.mock.method(console, 'error', () => undefined);
+  class FailingStore extends MemoryIncidentStore {
+    writes = 0;
+    override async saveActive(records: StoredIncident[]): Promise<void> {
+      if (++this.writes > 1) throw new Error('Redis remains unavailable');
+      await super.saveActive(records);
+    }
+  }
+  const incidentStore = new FailingStore();
+  incidentStore.active.set(majorIncident.id, {
+    incident: majorIncident, alertedAt: majorIncident.createdAt!,
+    activeNotificationChannels: ['discord'],
+  });
+  const messages: DiscordWebhookPayload[] = [];
+  await assert.rejects(checkRedditStatus('https://discord.com/api/webhooks/123/token', {
+    incidentStore, fetchImpl: createStatusAndDiscordFetch(() => [], messages),
+  }), /Redis remains unavailable/);
+  assert.equal(messages.length, 1);
+  assert.equal(incidentStore.active.size, 1);
+  assert.equal(incidentStore.lockToken, undefined);
 });
