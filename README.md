@@ -68,6 +68,7 @@ The app has access to these three domains:
 
 ## Version History
 
+* **1.0.2**: Icon size update.
 * **1.0.1**: Documentation improvements and an update to Devvit 0.14.3.
 * **1.0.0**: Initial release with bug/incident hardening.
 
@@ -83,6 +84,5 @@ See the [full version history](docs/version_history.md) for previous and alpha/b
 
 ## License
 
-This project is licensed under the [MIT License](https://opensource.org/license/mit).
-See [LICENSE](LICENSE) for the project's license text. Source code
-is available on [GitHub](https://github.com/kungming2/Site-Status-Alerts).
+This project is licensed under the [MIT License](https://opensource.org/license/mit). Source code and the license
+text is available on [GitHub](https://github.com/kungming2/Site-Status-Alerts).

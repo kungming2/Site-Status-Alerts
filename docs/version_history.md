@@ -2,6 +2,10 @@
 
 [Back to the README](../README.md)
 
+## 1.0.2
+
+- Embiggen the icon size.
+ 
 ## 1.0.1
 
 - Improve documentation with clearer setup guidance and streamlined release notes.
