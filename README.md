@@ -5,6 +5,12 @@ sitewide incidents listed on their [service status page](https://www.redditstatu
 Unsure if Reddit is actually down or if your internet is just acting a bit
 weird? SSA can send you notifications on Discord, Slack, or modmail.
 
+## Documentation
+
+- [Setup and troubleshooting](docs/setup.md): configure notification channels,
+  test delivery, and understand alert behavior.
+- [Version history](docs/version_history.md): current and previous releases.
+
 ## Implementation
 
 Every 30 minutes, this app checks Reddit's public [Statuspage API](https://www.redditstatus.com/#) for unresolved
@@ -32,9 +38,7 @@ After installing the app, open its subreddit settings:
   🟡 **Minor or higher**, 🟠 **Major or higher**, or 🔴 **Critical only**. 
   The default is **Major or higher**.
 - Under **Discord notifications**, enter a **Discord webhook URL**. (optional)
-- Under **Slack notifications**, enter a **Slack incoming webhook URL**.
-  Follow [Slack's incoming webhook guide](https://api.slack.com/messaging/webhooks)
-  to create one for the desired channel. Treat this URL as a secret. (optional)
+- Under **Slack notifications**, enter a **Slack incoming webhook URL**. (optional)
 - Under **Modmail notifications**, turn on **Enable Modmail notifications**.
 
 Please note that the app has no way of notifying moderators if modmail 
@@ -57,26 +61,19 @@ and deleted after the enabled resolution notifications are complete.
 The app requests access to these three domains:
 
 - `redditstatus.com` — fetches Reddit's unresolved incident feed.
-- `discord.com` — posts incident and resolution alerts when a webhook is
+- `discord.com` — posts incident and resolution alerts when a [webhook](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) is
   configured. Discord is on the Devvit [global fetch allowlist](https://developers.reddit.com/docs/capabilities/http-fetch#global-fetch-allowlist).
-- `slack.com` — posts incident and resolution alerts when a Slack incoming
-  webhook is configured. Slack is on the Devvit [global fetch allowlist](https://developers.reddit.com/docs/capabilities/http-fetch#global-fetch-allowlist).
+- `slack.com` — posts incident and resolution alerts when a [Slack incoming
+  webhook](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/) is configured. Slack is on the Devvit [global fetch allowlist](https://developers.reddit.com/docs/capabilities/http-fetch#global-fetch-allowlist).
 
 ## Version History
 
-* **0.5.3**: Relicense the project under the MIT License.
-* **0.5.2**: Display Discord incident, resolution, and test notifications as
-  compact rich embeds with severity-based colors and structured details.
-* **0.5.1**: Add moderator test outage alerts with severity filtering and
-  clearly marked Discord, Slack, and Modmail messages.
-* **0.5.0**: Add Slack incoming webhook alerts with independent delivery and
-  retry tracking for active and resolved incidents.
-* **0.3.4**: Fix status checks reading the configured minimum incident severity
-  and prevent saving it without a selection.
-* **0.3.3**: Add the app profile icon and align Devvit project dependencies.
-* **0.3.2**: Include approximate incident durations in resolution alerts.
-* **0.3.0**: Implement severity filtering in settings.
+* **0.9.0**: Add setup and troubleshooting documentation for notification
+  channels, manual checks, and test alerts; move the full release history to `docs/`.
+
+See the [full version history](docs/version_history.md) for previous releases.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](https://opensource.org/license/mit).
+See [LICENSE](LICENSE) for the project's license text.
